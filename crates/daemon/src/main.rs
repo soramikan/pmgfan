@@ -232,6 +232,11 @@ fn build_params(config_path: Option<&Path>, socket: PathBuf) -> Result<(daemon::
     if config.safety.ipmi_failure_limit == 0 {
         bail!("[safety] ipmi_failure_limit must be >= 1");
     }
+    if config.safety.sensor_stale_seconds == 0 {
+        bail!("[safety] sensor_stale_seconds must be >= 1");
+    }
+    let fail_action = daemon::FailAction::parse(&config.safety.fail_action)
+        .map_err(anyhow::Error::msg)?;
     // 機種照合は空文字だと contains() が常に真となり
     // 検証が無効化されるため拒否する
     if config.device.model.trim().is_empty() {
@@ -300,6 +305,8 @@ fn build_params(config_path: Option<&Path>, socket: PathBuf) -> Result<(daemon::
         ipmi_failure_limit: config.safety.ipmi_failure_limit.max(1),
         cpu_emergency: config.safety.cpu_emergency,
         pch_emergency: config.safety.pch_emergency,
+        sensor_stale: Duration::from_secs(config.safety.sensor_stale_seconds),
+        fail_action,
         expected_model: config.device.model.clone(),
     };
     Ok((params, config.device.interface))

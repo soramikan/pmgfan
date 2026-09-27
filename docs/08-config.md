@@ -104,10 +104,10 @@ max_pwm = 100
 
 | キー | 説明 |
 |---|---|
-| `sensor_stale_seconds` | センサー陳腐化 FAILSAFE（Phase 5・現在未使用） |
+| `sensor_stale_seconds` | 非空温度データの鮮度期限。超過で `fail_action` 発動 |
 | `ipmi_failure_limit` | 読み取り/書き込み系それぞれの連続失敗回数の閾値（→ `Degraded`） |
 | `cpu_emergency` / `pch_emergency` | 緊急温度。超過時はモードに関わらず 100% PWM（`Failsafe`） |
-| `fail_action` | `irmc-auto`（override 解除）。現在はこれのみ |
+| `fail_action` | 監視系フェイル時の挙動。`irmc-auto`（既定・override 解除）または `full-speed`（100% 強制） |
 
 ### `[[curve]]`
 

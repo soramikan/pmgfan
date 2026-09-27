@@ -48,6 +48,17 @@ daemon shutdown
   連続失敗がそれぞれ `ipmi_failure_limit`（既定3）に達すると
   `state = Degraded`。回復は全ドメインが健全になった時のみ
   （ドメイン間で状態が振動しない）
+- **温度データ陳腐化**: 非空の温度データが
+  `sensor_stale_seconds`（既定10秒）更新されなければ
+  `fail_action` を発動し `state = Degraded`。空レスポンスは
+  鮮度を更新しないため「取れているが空」も検出できる
+- **0 RPM 検出**: 有効なファンが `ipmi_failure_limit` 連続で
+  0 RPM を報告すると `fail_action` を発動し `state = Degraded`
+  （rpm を返さない Disabled/nr ファンは対象外）
+- **fail_action**: 監視系フェイル発生時の挙動。
+  `irmc-auto`（既定）= override 解除して iRMC へ戻す、
+  `full-speed` = 100% PWM を強制。条件が続く間は通常モードの
+  制御を停止し、解消後は自動で通常制御に復帰する
 - **機種検証**: 起動時に FRU の Product Name を `device.model`
   と照合し、不一致・取得失敗では起動しない（fail-closed）
 - **モード変更の直列化**: `apply_mode` の iRMC Auto 即時解除と
@@ -67,9 +78,8 @@ daemon shutdown
   空の `device.model`、非有限・範囲外の緊急温度などは
   起動時にエラー終了
 
-未実装: `sensor_stale_seconds`（センサー陳腐化検出）、
-`fail_action` 以外のフェイルアクション、0 RPM 検出
-（いずれも Phase 5 予定）。
+残る課題: 個別センサー単位の陳腐化（現状は全体の鮮度）、
+SDR センサーの critical しきい値アラーム利用。
 
 ## FAILSAFE の動作
 

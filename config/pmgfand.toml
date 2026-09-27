@@ -24,14 +24,14 @@ down_hysteresis = 5
 min_apply_interval_ms = 5000
 
 [safety]
-sensor_stale_seconds = 10  # センサー陳腐化 FAILSAFE（Phase 5・現在未使用）
+sensor_stale_seconds = 10  # 非空温度データの鮮度期限。超過で fail_action 発動
 ipmi_failure_limit = 3
 
 # 緊急温度。超過時はモードに関わらず 100% PWM を強制し Failsafe 状態へ
 cpu_emergency = 90
 pch_emergency = 95
 
-fail_action = "irmc-auto"  # 現在は irmc-auto 固定（他アクション未実装）
+fail_action = "irmc-auto"  # 監視系フェイル時: "irmc-auto"（解除）or "full-speed"（100% 強制）
 
 [[curve]]
 sensor = "cpu_package"

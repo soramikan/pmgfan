@@ -29,6 +29,27 @@ const EMERGENCY_PWM: u8 = 100;
 /// シャットダウン時に制御ループの終了を待つ上限。
 const SHUTDOWN_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// フェイルアクション（監視系の致命的失敗時の挙動）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailAction {
+    /// OEM override を解除して iRMC 自動制御へ戻す（既定）
+    IrmcAuto,
+    /// 100% PWM を強制する（iRMC 自体が信用できない場合向け）
+    FullSpeed,
+}
+
+impl FailAction {
+    pub fn parse(s: &str) -> std::result::Result<Self, String> {
+        match s {
+            "irmc-auto" | "irmc_auto" => Ok(Self::IrmcAuto),
+            "full-speed" | "full_speed" => Ok(Self::FullSpeed),
+            other => Err(format!(
+                "unknown fail_action '{other}' (expected \"irmc-auto\" or \"full-speed\")"
+            )),
+        }
+    }
+}
+
 /// デーモン動作パラメータ（config または既定値から構築）。
 #[derive(Debug, Clone)]
 pub struct Params {
@@ -42,6 +63,10 @@ pub struct Params {
     pub ipmi_failure_limit: u32,
     pub cpu_emergency: f32,
     pub pch_emergency: f32,
+    /// 温度データがこの期間更新されなければフェイルとみなす
+    pub sensor_stale: Duration,
+    /// センサー陳腐化・0 RPM 時のアクション
+    pub fail_action: FailAction,
     /// 起動時に FRU 製品名を照合する期待値
     pub expected_model: String,
 }
@@ -76,6 +101,15 @@ pub struct Shared {
     /// 毎 tick 真偽を更新し、回復もこのフラグ経由で行う。
     /// mode が Curve 以外の時は無視される）
     pub curve_sensors_missing: bool,
+    /// 最後に「非空の」温度データがコミットされた時刻。
+    /// これが `sensor_stale` を超えるとフェイルアクション発動
+    pub last_temp_ok: Instant,
+    /// 温度データ陳腐化フラグ（制御ループが毎 tick 更新）
+    pub sensor_stale: bool,
+    /// 有効なファンが 0 RPM を連続して報告している（ポーリングが管理）
+    pub zero_rpm_detected: bool,
+    /// 0 RPM を観測した連続ポーリング回数
+    pub zero_rpm_count: u32,
     /// 最後にファン読み取りが成功した時刻（watchdog の鮮度判定用）
     pub last_poll_ok: Instant,
     pub started: Instant,
@@ -96,6 +130,10 @@ impl Shared {
             write_failures: 0,
             clear_pending: false,
             curve_sensors_missing: false,
+            last_temp_ok: Instant::now(),
+            sensor_stale: false,
+            zero_rpm_detected: false,
+            zero_rpm_count: 0,
             last_poll_ok: Instant::now(),
             started: Instant::now(),
         }
@@ -122,6 +160,8 @@ fn refresh_state(s: &mut Shared, failure_limit: u32) {
         || s.temp_failures >= failure_limit
         || s.write_failures >= failure_limit
         || s.clear_pending
+        || s.sensor_stale
+        || s.zero_rpm_detected
         || (matches!(s.mode, Mode::Curve) && s.curve_sensors_missing);
     s.state = if degraded {
         DaemonState::Degraded
@@ -211,6 +251,8 @@ where
         let curves = params.curves.clone();
         let limit = params.ipmi_failure_limit;
         let (cpu_em, pch_em) = (params.cpu_emergency, params.pch_emergency);
+        let stale_secs = params.sensor_stale.as_secs();
+        let fail_action = params.fail_action;
         tokio::spawn(async move {
             control_loop(
                 &*backend,
@@ -223,6 +265,8 @@ where
                 limit,
                 cpu_em,
                 pch_em,
+                stale_secs,
+                fail_action,
             )
             .await
         })
@@ -350,6 +394,26 @@ async fn poll_fans_loop<B: FanControlBackend>(
         let mut s = shared.write().await;
         match result {
             Ok(fans) => {
+                // 有効ファンが 0 RPM を報告し続けるか観測する。
+                // 回転数自体を返さないファン（Disabled/nr）は
+                // rpm=None なので自然に除外される
+                let zero_fans: Vec<&str> = fans
+                    .iter()
+                    .filter(|f| f.rpm == Some(0))
+                    .map(|f| f.name.as_str())
+                    .collect();
+                if zero_fans.is_empty() {
+                    s.zero_rpm_count = 0;
+                    s.zero_rpm_detected = false;
+                } else {
+                    s.zero_rpm_count += 1;
+                    if s.zero_rpm_count >= failure_limit && !s.zero_rpm_detected {
+                        s.zero_rpm_detected = true;
+                        s.last_error =
+                            Some(format!("fan(s) reporting 0 RPM: {}", zero_fans.join(", ")));
+                        warn!(fans = ?zero_fans, "zero-RPM fan detected");
+                    }
+                }
                 s.fans = fans;
                 s.fan_failures = 0;
                 s.last_poll_ok = Instant::now();
@@ -404,11 +468,19 @@ async fn poll_temps_loop<B: FanControlBackend>(
         match result {
             Ok(mut temps) => {
                 temps.extend(hw);
+                // 「非空の」温度データが届いた時刻のみ鮮度を更新
+                // （空レスポンスは陳腐化判定でフェイル扱いにする）
+                if !temps.is_empty() {
+                    s.last_temp_ok = Instant::now();
+                }
                 s.temps = temps;
                 s.temp_failures = 0;
             }
             Err(e) => {
                 // IPMI 温度が取れなくても hwmon だけは更新する
+                if !hw.is_empty() {
+                    s.last_temp_ok = Instant::now();
+                }
                 s.temps = hw;
                 s.temp_failures += 1;
                 warn!(failures = s.temp_failures, error = %e, "ipmi temperature read failed");
@@ -449,6 +521,8 @@ async fn control_loop<B: FanControlBackend>(
     failure_limit: u32,
     cpu_emergency: f32,
     pch_emergency: f32,
+    sensor_stale_secs: u64,
+    fail_action: FailAction,
 ) {
     let mut limiter = RateLimiter::new(params);
     let mut seen_gen = 0u64;
@@ -474,7 +548,7 @@ async fn control_loop<B: FanControlBackend>(
         }
         // PWM 操作は apply_mode の即時解除と直列化する
         let _ctrl = ctrl.lock().await;
-        let (mode, gen, temps, applied_pwm, clear_pending) = {
+        let (mode, gen, temps, applied_pwm, clear_pending, sensor_stale, zero_rpm) = {
             let s = shared.read().await;
             (
                 s.mode.clone(),
@@ -482,8 +556,18 @@ async fn control_loop<B: FanControlBackend>(
                 s.temps.clone(),
                 s.pwm,
                 s.clear_pending,
+                s.last_temp_ok.elapsed() > Duration::from_secs(sensor_stale_secs),
+                s.zero_rpm_detected,
             )
         };
+        {
+            // 陳腐化フラグを refresh_state の失敗ドメインへ反映
+            let mut s = shared.write().await;
+            if s.sensor_stale != sensor_stale {
+                s.sensor_stale = sensor_stale;
+                refresh_state(&mut s, failure_limit);
+            }
+        }
         if gen != seen_gen {
             limiter.reset();
             // 現在適用中の値から変化を継続する
@@ -546,6 +630,21 @@ async fn control_loop<B: FanControlBackend>(
                     s.last_error = None;
                 }
             }
+        }
+
+        // 監視系フェイル（温度データ陳腐化・0 RPM）。条件が
+        // 解消するまで通常モードの制御を停止し、設定された
+        // フェイルアクションを適用する
+        if sensor_stale || zero_rpm {
+            let reason = if sensor_stale && zero_rpm {
+                "sensor data stale + fan at 0 RPM"
+            } else if sensor_stale {
+                "sensor data stale"
+            } else {
+                "fan at 0 RPM"
+            };
+            run_fail_action(backend, shared, fail_action, reason, failure_limit).await;
+            continue;
         }
 
         match mode {
@@ -656,6 +755,56 @@ async fn control_loop<B: FanControlBackend>(
                 // Phase 7 で実装。set_mode では拒否済みだが
                 // config 直書き等で来た場合の保険。
                 warn!("target_rpm mode is not implemented yet");
+            }
+        }
+    }
+}
+
+/// 監視系フェイルのアクションを実行する。
+/// 条件が続く間は制御ループが毎 tick 呼ぶ（冪等）。
+async fn run_fail_action<B: FanControlBackend>(
+    backend: &B,
+    shared: &RwLock<Shared>,
+    action: FailAction,
+    reason: &str,
+    failure_limit: u32,
+) {
+    match action {
+        FailAction::IrmcAuto => {
+            let needs_clear = {
+                let s = shared.read().await;
+                s.pwm.is_some() || s.clear_pending
+            };
+            if needs_clear {
+                warn!(reason, "fail action: clearing override (iRMC auto)");
+                match backend.clear_override().await {
+                    Ok(()) => {
+                        let mut s = shared.write().await;
+                        s.pwm = None;
+                        s.clear_pending = false;
+                        s.write_failures = 0;
+                    }
+                    Err(e) => {
+                        let mut s = shared.write().await;
+                        s.clear_pending = true;
+                        s.write_failures += 1;
+                        s.last_error = Some(e.to_string());
+                        error!(error = %e, "fail action clear failed; will retry");
+                    }
+                }
+            }
+            let mut s = shared.write().await;
+            if s.last_error.is_none() {
+                s.last_error = Some(format!("failsafe: {reason}"));
+            }
+            refresh_state(&mut s, failure_limit);
+        }
+        FailAction::FullSpeed => {
+            warn!(reason, "fail action: forcing 100% pwm");
+            write_pwm(backend, shared, EMERGENCY_PWM, failure_limit).await;
+            let mut s = shared.write().await;
+            if s.last_error.is_none() {
+                s.last_error = Some(format!("failsafe: {reason}"));
             }
         }
     }
@@ -863,6 +1012,7 @@ fn spawn_watchdog(shared: Arc<RwLock<Shared>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pmgfan_core::fan::{FanReading, FanStatus};
     use pmgfan_core::sensor::TempReading;
     use pmgfan_ipmi::backend::{IpmiError, PwmSlot, Result as IpmiResult};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -875,6 +1025,7 @@ mod tests {
         fail_clear: AtomicBool,
         fail_write: AtomicBool,
         temps: Vec<TempReading>,
+        fans: Vec<FanReading>,
     }
 
     impl MockBackend {
@@ -886,6 +1037,7 @@ mod tests {
                 fail_clear: AtomicBool::new(false),
                 fail_write: AtomicBool::new(false),
                 temps: Vec::new(),
+                fans: Vec::new(),
             }
         }
     }
@@ -895,7 +1047,7 @@ mod tests {
             async move { Ok(self.model.clone()) }
         }
         fn fans(&self) -> impl std::future::Future<Output = IpmiResult<Vec<FanReading>>> + Send {
-            async move { Ok(Vec::new()) }
+            async move { Ok(self.fans.clone()) }
         }
         fn temperatures(
             &self,
@@ -1096,6 +1248,8 @@ mod tests {
                 3,
                 90.0,
                 95.0,
+                10,
+                FailAction::IrmcAuto,
             )
             .await
         });
@@ -1143,6 +1297,141 @@ mod tests {
         assert_eq!(st.state, DaemonState::Monitoring);
         assert_eq!(st.pwm, None);
         assert!(b.clear_calls.load(Ordering::SeqCst) >= 1);
+    }
+
+    /// センサー陳腐化フェイルの回帰テスト。last_temp_ok を
+    /// 過去にして stale 発火 → fail action → 復帰まで確認。
+    #[tokio::test]
+    async fn sensor_stale_triggers_irmc_auto_and_recovers() {
+        let b = Arc::new(MockBackend::new());
+        let s = Arc::new(RwLock::new(Shared::new(Mode::FixedPwm(50))));
+        let c = Arc::new(Mutex::new(()));
+        let (tx, rx) = watch::channel(false);
+        let (bb, ss, cc) = (Arc::clone(&b), Arc::clone(&s), Arc::clone(&c));
+        let task = tokio::spawn(async move {
+            control_loop(
+                bb.as_ref(),
+                ss.as_ref(),
+                cc.as_ref(),
+                rx,
+                params(),
+                &[],
+                Duration::from_millis(10),
+                3,
+                90.0,
+                95.0,
+                1,
+                FailAction::IrmcAuto,
+            )
+            .await
+        });
+        // 温度データが古いまま → stale 発火
+        {
+            let mut w = s.write().await;
+            w.temps = vec![TempReading {
+                chip: "ipmi".into(),
+                label: "CPU".into(),
+                celsius: 40.0,
+            }];
+            w.last_temp_ok = Instant::now() - Duration::from_secs(30);
+            w.pwm = Some(50);
+        }
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        {
+            let st = s.read().await;
+            assert_eq!(st.state, DaemonState::Degraded);
+            assert!(st.sensor_stale);
+            // irmc-auto fail action: override が解除される
+            assert_eq!(st.pwm, None);
+        }
+        assert!(b.clear_calls.load(Ordering::SeqCst) >= 1);
+        // 温度が新鮮に戻る → 通常制御（FixedPwm）へ復帰
+        s.write().await.last_temp_ok = Instant::now();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        {
+            let st = s.read().await;
+            assert_eq!(st.state, DaemonState::Controlling);
+            assert_eq!(st.pwm, Some(50));
+        }
+        tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    /// fail_action = "full-speed" の場合 100% 強制になる
+    #[tokio::test]
+    async fn sensor_stale_full_speed_action() {
+        let b = Arc::new(MockBackend::new());
+        let s = Arc::new(RwLock::new(Shared::new(Mode::FixedPwm(50))));
+        let c = Arc::new(Mutex::new(()));
+        let (tx, rx) = watch::channel(false);
+        let (bb, ss, cc) = (Arc::clone(&b), Arc::clone(&s), Arc::clone(&c));
+        let task = tokio::spawn(async move {
+            control_loop(
+                bb.as_ref(),
+                ss.as_ref(),
+                cc.as_ref(),
+                rx,
+                params(),
+                &[],
+                Duration::from_millis(10),
+                3,
+                90.0,
+                95.0,
+                1,
+                FailAction::FullSpeed,
+            )
+            .await
+        });
+        {
+            let mut w = s.write().await;
+            w.temps = vec![TempReading {
+                chip: "ipmi".into(),
+                label: "CPU".into(),
+                celsius: 40.0,
+            }];
+            w.last_temp_ok = Instant::now() - Duration::from_secs(30);
+        }
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        {
+            let st = s.read().await;
+            assert_eq!(st.pwm, Some(EMERGENCY_PWM));
+            assert_eq!(st.state, DaemonState::Degraded);
+        }
+        tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    /// 0 RPM ファンが連続報告されると zero_rpm_detected が立ち
+    /// Degraded になる（復帰で解除されることも確認）
+    #[tokio::test]
+    async fn zero_rpm_fan_sets_failure_domain() {
+        let mut mb = MockBackend::new();
+        mb.fans = vec![FanReading {
+            name: "FAN CPU".into(),
+            rpm: Some(0),
+            status: FanStatus::Ok,
+        }];
+        let b = Arc::new(mb);
+        let s = Arc::new(RwLock::new(Shared::new(Mode::FixedPwm(50))));
+        let (_tx, rx) = watch::channel(false);
+        let (bb, ss) = (Arc::clone(&b), Arc::clone(&s));
+        let task = tokio::spawn(async move {
+            poll_fans_loop(bb.as_ref(), ss.as_ref(), rx, Duration::from_millis(10), 2).await
+        });
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        {
+            let st = s.read().await;
+            assert!(st.zero_rpm_detected);
+            assert_eq!(st.state, DaemonState::Degraded);
+            assert!(st.last_error.as_ref().unwrap().contains("FAN CPU"));
+        }
+        task.abort();
     }
 
     #[test]

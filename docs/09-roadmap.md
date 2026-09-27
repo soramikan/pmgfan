@@ -6,7 +6,7 @@
 | 2 | daemon + Unix socket | ✅ 実機検証済み |
 | 3 | Fixed PWM / iRMC Auto | ✅ 実機検証済み |
 | 4 | ファンカーブ | ✅ 実機検証済み |
-| 5 | Safety state machine + systemd watchdog | 一部済み（watchdog/Degraded/フェイルセーフ動作） |
+| 5 | Safety state machine + systemd watchdog | 済み（watchdog/Degraded/緊急温度/センサー陳腐化/0 RPM/fail_action） |
 | 6 | Ratatui TUI | 未着手 |
 | 7 | Target RPM PI controller | 未着手 |
 | 8 | 自動キャリブレーション | 未着手 |
