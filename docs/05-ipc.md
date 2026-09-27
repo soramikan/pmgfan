@@ -13,6 +13,12 @@ root:pmgfan
 0660
 ```
 
+親ディレクトリ `/run/pmgfand` は `root:pmgfan 0750` が必要
+（socket へ辿り着くための traversal 権限）。systemd では
+unit の `RuntimeDirectoryMode=0750` + `Group=pmgfan` で用意し、
+手動起動では pmgfand が自ら作成した場合に同じ権限を付与する
+（既存ディレクトリの権限は変更しない）。
+
 ユーザーは `pmgfan` グループに追加して使う:
 
 ```bash

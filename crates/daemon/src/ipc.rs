@@ -23,30 +23,39 @@ const SOCKET_GROUP: &str = "pmgfan";
 /// 誤動作クライアントの巨大入力でメモリを圧迫しないための上限）。
 const MAX_REQUEST_BYTES: u64 = 16 * 1024;
 
+/// 実行時ディレクトリを用意する。
+///
+/// リーフディレクトリを `create_dir` で1回だけ作成し、その成否で
+/// 「自分が作ったか」を判定する（`exists()` や `create_dir_all` の
+/// Ok では判定できず、競合・TOCTOU に弱い）。
+/// 自分が作成したディレクトリにだけ 0750 + pmgfan グループを
+/// 適用し、既存ディレクトリは一切触らない。
+pub fn prepare_runtime_dir(dir: &Path) -> std::io::Result<()> {
+    if dir.as_os_str().is_empty() {
+        return Ok(());
+    }
+    // 親チェーンの作成は競合しても無害（権限はリーフだけに適用）
+    if let Some(parent) = dir.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    match std::fs::create_dir(dir) {
+        Ok(()) => set_dir_permissions(dir),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 /// socket を bind し、権限を設定する。`READY=1` より先に完了させる
 /// ため、serve の spawn 前に呼ぶ。
 ///
-/// 親ディレクトリの権限・グループは、この関数が自ら作成した
-/// 場合にのみ変更する（`--socket` で既存ディレクトリ
-/// （例: /tmp）を指されても、その属性を勝手に変えない）。
+/// 親ディレクトリの権限・グループは、自ら作成した場合にのみ
+/// 変更する（`--socket` で既存ディレクトリ（例: /tmp）を指されても、
+/// その属性を勝手に変えない）。なおデーモン経路では
+/// `acquire_instance_lock` が先に `prepare_runtime_dir` で
+/// ディレクトリを用意しているため、ここでは既存扱いになる。
 pub fn bind(path: &Path) -> std::io::Result<UnixListener> {
     if let Some(dir) = path.parent() {
-        if !dir.as_os_str().is_empty() {
-            // exists()+create_dir_all だと「先に存在した」のか
-            // 「自分が作った」のか区別できないため、create_dir の
-            // 結果で判定する（作成した dir にだけ権限を与える）。
-            match std::fs::create_dir(dir) {
-                Ok(()) => {
-                    set_dir_permissions(dir)?;
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(_) => {
-                    // 親が無い等 → create_dir_all で作成した
-                    std::fs::create_dir_all(dir)?;
-                    set_dir_permissions(dir)?;
-                }
-            }
-        }
+        prepare_runtime_dir(dir)?;
     }
     let _ = std::fs::remove_file(path); // stale socket
     let listener = UnixListener::bind(path)?;

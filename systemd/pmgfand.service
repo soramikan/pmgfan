@@ -17,6 +17,10 @@ TimeoutStopSec=10s
 
 RuntimeDirectory=pmgfand
 RuntimeDirectoryMode=0750
+# ランタイム dir / socket を root:pmgfan にして非 root クライアント
+# （pmgfan グループ）からアクセス可能にする。pmgfan グループが
+# 存在しないと起動に失敗するので先に作成しておく
+Group=pmgfan
 
 ProtectSystem=strict
 ProtectHome=yes

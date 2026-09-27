@@ -237,6 +237,18 @@ fn build_params(config_path: Option<&Path>, socket: PathBuf) -> Result<(daemon::
     if config.device.model.trim().is_empty() {
         bail!("[device] model must not be empty");
     }
+    // 空 interface だと `ipmitool -I ""` になる
+    if config.device.interface.trim().is_empty() {
+        bail!("[device] interface must not be empty");
+    }
+    // 現状 ipmitool バックエンドのみ実装（native は Phase 9）。
+    // 未対応値を黙って無視しない
+    if config.device.backend != "ipmitool" {
+        bail!(
+            "[device] backend '{}' is not supported yet (only \"ipmitool\" is implemented)",
+            config.device.backend
+        );
+    }
     for (key, v) in [
         ("cpu_emergency", config.safety.cpu_emergency),
         ("pch_emergency", config.safety.pch_emergency),

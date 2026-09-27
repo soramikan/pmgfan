@@ -71,6 +71,11 @@ pub struct Shared {
     /// 不明なことを示し、mode が IrmcAuto の間制御ループが
     /// 解除を再試行する
     pub clear_pending: bool,
+    /// Curve モードで参照センサーが1つも解決できない。
+    /// `refresh_state` が Degraded 判定に使う（制御ループが
+    /// 毎 tick 真偽を更新し、回復もこのフラグ経由で行う。
+    /// mode が Curve 以外の時は無視される）
+    pub curve_sensors_missing: bool,
     /// 最後にファン読み取りが成功した時刻（watchdog の鮮度判定用）
     pub last_poll_ok: Instant,
     pub started: Instant,
@@ -90,6 +95,7 @@ impl Shared {
             temp_failures: 0,
             write_failures: 0,
             clear_pending: false,
+            curve_sensors_missing: false,
             last_poll_ok: Instant::now(),
             started: Instant::now(),
         }
@@ -115,12 +121,19 @@ fn refresh_state(s: &mut Shared, failure_limit: u32) {
     let degraded = s.fan_failures >= failure_limit
         || s.temp_failures >= failure_limit
         || s.write_failures >= failure_limit
-        || s.clear_pending;
+        || s.clear_pending
+        || (matches!(s.mode, Mode::Curve) && s.curve_sensors_missing);
     s.state = if degraded {
         DaemonState::Degraded
     } else {
         normal_state(&s.mode)
     };
+}
+
+/// `last_error` を消してよい健全状態か（診断が意味を持つ
+/// `Degraded`/`Failsafe` の間は消さない）。
+fn is_healthy_state(state: DaemonState) -> bool {
+    !matches!(state, DaemonState::Degraded | DaemonState::Failsafe)
 }
 
 /// デーモンを起動し、シャットダウンまでブロックする。
@@ -342,7 +355,7 @@ async fn poll_fans_loop<B: FanControlBackend>(
                 s.last_poll_ok = Instant::now();
                 refresh_state(&mut s, failure_limit);
                 // 他ドメインの診断を消さないよう、健全な場合だけクリア
-                if s.state != DaemonState::Degraded {
+                if is_healthy_state(s.state) {
                     s.last_error = None;
                 }
             }
@@ -404,7 +417,7 @@ async fn poll_temps_loop<B: FanControlBackend>(
         }
         refresh_state(&mut s, failure_limit);
         // 他ドメインの診断を消さないよう、健全な場合だけクリア
-        if ok && s.state != DaemonState::Degraded {
+        if ok && is_healthy_state(s.state) {
             s.last_error = None;
         }
     }
@@ -494,10 +507,12 @@ async fn control_loop<B: FanControlBackend>(
         }
         if emergency_active {
             // 緊急解除後の復帰。Auto モードでは 100% 強制が残らない
-            // よう解除して Monitoring へ戻す。強制系は 100% を
-            // 起点に滑らかに下げる。いずれも Failsafe ラッチは
-            // ここで解除する（refresh_state は Failsafe を
-            // 上書きしないので、先に正常状態へ戻してから再評価）
+            // よう解除して Monitoring へ戻す。FixedPwm は次の
+            // 書き込みで p に即戻り、Curve は 100% 起点で
+            // limiter 経由の滑らかな降下になる。いずれも
+            // Failsafe ラッチはここで解除する（refresh_state は
+            // Failsafe を上書きしないので、先に正常状態へ
+            // 戻してから再評価）
             emergency_active = false;
             info!("emergency cleared; restoring normal control");
             if mode == Mode::IrmcAuto {
@@ -509,7 +524,7 @@ async fn control_loop<B: FanControlBackend>(
                         s.write_failures = 0;
                         s.state = normal_state(&s.mode);
                         refresh_state(&mut s, failure_limit);
-                        if s.state != DaemonState::Degraded {
+                        if is_healthy_state(s.state) {
                             s.last_error = None;
                         }
                     }
@@ -527,7 +542,7 @@ async fn control_loop<B: FanControlBackend>(
                 let mut s = shared.write().await;
                 s.state = normal_state(&s.mode);
                 refresh_state(&mut s, failure_limit);
-                if s.state != DaemonState::Degraded {
+                if is_healthy_state(s.state) {
                     s.last_error = None;
                 }
             }
@@ -545,7 +560,7 @@ async fn control_loop<B: FanControlBackend>(
                             s.pwm = None;
                             s.write_failures = 0;
                             refresh_state(&mut s, failure_limit);
-                            if s.state != DaemonState::Degraded {
+                            if is_healthy_state(s.state) {
                                 s.last_error = None;
                             }
                             info!("override cleared (retry)");
@@ -609,23 +624,32 @@ async fn control_loop<B: FanControlBackend>(
                                 }
                             }
                         }
-                        shared.write().await.state = DaemonState::Degraded;
+                        // センサー全滅は refresh_state の失敗ドメイン
+                        // として管理（直書きだとポーリング成功ごとに
+                        // 状態が振動する）
+                        let mut s = shared.write().await;
+                        s.curve_sensors_missing = true;
+                        s.last_error = Some("no curve sensors readable".into());
+                        refresh_state(&mut s, failure_limit);
                     }
-                    Some(target) => match limiter.next(target) {
-                        Some(p) => {
-                            write_pwm(backend, shared, p, failure_limit).await;
-                            ticks_since_write = 0;
-                        }
-                        None => {
-                            ticks_since_write += 1;
-                            if ticks_since_write >= REASSERT_TICKS {
-                                if let Some(p) = limiter.current() {
-                                    write_pwm(backend, shared, p, failure_limit).await;
-                                }
+                    Some(target) => {
+                        shared.write().await.curve_sensors_missing = false;
+                        match limiter.next(target) {
+                            Some(p) => {
+                                write_pwm(backend, shared, p, failure_limit).await;
                                 ticks_since_write = 0;
                             }
+                            None => {
+                                ticks_since_write += 1;
+                                if ticks_since_write >= REASSERT_TICKS {
+                                    if let Some(p) = limiter.current() {
+                                        write_pwm(backend, shared, p, failure_limit).await;
+                                    }
+                                    ticks_since_write = 0;
+                                }
+                            }
                         }
-                    },
+                    }
                 }
             }
             Mode::TargetRpm { .. } => {
@@ -674,7 +698,7 @@ async fn write_pwm<B: FanControlBackend>(
             s.write_failures = 0;
             refresh_state(&mut s, failure_limit);
             // 他ドメインの診断を消さないよう、健全な場合だけクリア
-            if s.state != DaemonState::Degraded {
+            if is_healthy_state(s.state) {
                 s.last_error = None;
             }
         }
@@ -698,7 +722,9 @@ fn read_hwmon() -> Vec<TempReading> {
 /// 取得した File を保持している間ロックは有効。既に他プロセスが
 /// 保持していればエラーにする。
 fn acquire_instance_lock(run_dir: &Path) -> Result<std::fs::File> {
-    std::fs::create_dir_all(run_dir).with_context(|| {
+    // ディレクトリを作成した場合のみ 0750 + pmgfan グループを
+    // 適用する（systemd 経由では unit の Group=pmgfan が用意する）
+    ipc::prepare_runtime_dir(run_dir).with_context(|| {
         format!("cannot create runtime directory {}", run_dir.display())
     })?;
     let lock_path = run_dir.join("pmgfand.lock");
@@ -736,6 +762,9 @@ pub async fn apply_mode<B: FanControlBackend>(
                 s.write_failures += 1;
                 s.clear_pending = true;
                 s.last_error = Some(e.to_string());
+                // 他の失敗経路と揃えて即座に可視化する
+                // （Failsafe は次 tick で再評価される）
+                s.state = DaemonState::Degraded;
                 return Err(e.to_string());
             }
             let mut s = shared.write().await;
@@ -1057,9 +1086,9 @@ mod tests {
         let (bb, ss, cc) = (Arc::clone(&b), Arc::clone(&s), Arc::clone(&c));
         let task = tokio::spawn(async move {
             control_loop(
-                &*bb,
-                &*ss,
-                &*cc,
+                bb.as_ref(),
+                ss.as_ref(),
+                cc.as_ref(),
                 rx,
                 params(),
                 &[],

@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub device: DeviceConfig,
@@ -16,19 +16,6 @@ pub struct Config {
     #[serde(rename = "curve")]
     pub curves: Vec<CurveConfig>,
     pub target_rpm: Option<TargetRpmConfig>,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            device: DeviceConfig::default(),
-            monitor: MonitorConfig::default(),
-            control: ControlConfig::default(),
-            safety: SafetyConfig::default(),
-            curves: Vec::new(),
-            target_rpm: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
