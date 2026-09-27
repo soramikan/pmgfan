@@ -88,6 +88,10 @@ struct App {
     rx: mpsc::UnboundedReceiver<Outcome>,
     /// ポーリング要求が飛行中か（多重ポーリング防止）。
     poll_inflight: bool,
+    /// モード変更要求が飛行中か（並行 SetMode 防止）。
+    req_inflight: bool,
+    /// 最後にポーリングを開始した時刻。
+    last_poll: Instant,
 }
 
 impl App {
@@ -113,6 +117,11 @@ impl App {
             tx,
             rx,
             poll_inflight: false,
+            req_inflight: false,
+            // 初回ポーリングを即座に起こすため過去時刻にする
+            last_poll: Instant::now()
+                .checked_sub(POLL_INTERVAL)
+                .unwrap_or_else(Instant::now),
         }
     }
 
@@ -124,6 +133,7 @@ impl App {
     /// イベントループをブロックしない。
     fn spawn_refresh(&mut self) {
         self.poll_inflight = true;
+        self.last_poll = Instant::now();
         let socket = self.socket.clone();
         let tx = self.tx.clone();
         tokio::spawn(async move {
@@ -158,7 +168,14 @@ impl App {
     }
 
     /// モード変更要求をバックグラウンドで送信する。
+    /// 前の要求が飛行中なら無視する（デーモン側の適用順と
+    /// キー押下順が逆転するのを防ぐ）。
     fn set_mode(&mut self, mode: Mode, label: &str) {
+        if self.req_inflight {
+            self.notify("a request is already in flight");
+            return;
+        }
+        self.req_inflight = true;
         let socket = self.socket.clone();
         let tx = self.tx.clone();
         let label = label.to_string();
@@ -204,16 +221,20 @@ impl App {
                 self.poll_inflight = false;
                 self.conn_error = Some(e);
             }
-            Outcome::ModeSet { label, result } => match result {
-                Ok(()) => {
-                    self.notify(format!("mode applied: {label}"));
-                    // 直後の画面更新のため即座に再ポーリング
-                    if !self.poll_inflight {
-                        self.spawn_refresh();
+            Outcome::ModeSet { label, result } => {
+                self.req_inflight = false;
+                match result {
+                    Ok(()) => {
+                        self.notify(format!("mode applied: {label}"));
+                        // 直後の画面更新のため即座に再ポーリング
+                        // （spawn_refresh が last_poll も更新する）
+                        if !self.poll_inflight {
+                            self.spawn_refresh();
+                        }
                     }
+                    Err(e) => self.notify(e),
                 }
-                Err(e) => self.notify(e),
-            },
+            }
         }
     }
 
@@ -254,10 +275,13 @@ pub async fn run(socket: &Path, config_path: Option<&Path>) -> Result<()> {
     for kind in [SignalKind::terminate(), SignalKind::interrupt()] {
         let stop = stop.clone();
         tokio::spawn(async move {
+            // 登録失敗・recv が None を返した場合は
+            // 終了扱いにしない（単にシグナル無しで動作する）
             if let Ok(mut s) = signal(kind) {
-                s.recv().await;
+                if s.recv().await.is_some() {
+                    stop.store(true, Ordering::SeqCst);
+                }
             }
-            stop.store(true, Ordering::SeqCst);
         });
     }
 
@@ -275,9 +299,8 @@ pub async fn run(socket: &Path, config_path: Option<&Path>) -> Result<()> {
     }
 
     // 初回ポーリングはバックグラウンドなので、即座に
-    // "connecting" 画面を描画できる。
-    let mut last_poll = Instant::now() - POLL_INTERVAL;
-
+    // "connecting" 画面を描画できる（last_poll は
+    // App::new で過去時刻に初期化済み）。
     while !app.quit && !stop.load(Ordering::SeqCst) {
         terminal.draw(|f| draw(f, &app))?;
         if event::poll(TICK)? {
@@ -288,9 +311,8 @@ pub async fn run(socket: &Path, config_path: Option<&Path>) -> Result<()> {
             }
         }
         app.drain_outcomes();
-        if !app.poll_inflight && last_poll.elapsed() >= POLL_INTERVAL {
+        if !app.poll_inflight && app.last_poll.elapsed() >= POLL_INTERVAL {
             app.spawn_refresh();
-            last_poll = Instant::now();
         }
         // 古い notice を消す
         if app
@@ -552,11 +574,12 @@ fn draw_fans(f: &mut Frame, app: &App, area: Rect) {
         })
         .collect();
     // 表示しきれない分はインジケータで知らせる（Alarm の見落とし防止）。
+    // 最終行をインジケータに譲るため、実際に隠れる数は hidden+1。
     let hidden = status.fans.len().saturating_sub(visible);
     if hidden > 0 && !lines.is_empty() {
         lines.pop();
         lines.push(Line::from(Span::styled(
-            format!(" … +{hidden} more"),
+            format!(" … +{} more", hidden + 1),
             Style::default().fg(Color::DarkGray),
         )));
     }
@@ -572,29 +595,23 @@ fn draw_temps(f: &mut Frame, app: &App, area: Rect) {
         return;
     };
     // センサーごとに [name] [temp] [sparkline] の行を並べる。
-    // 行数が多いので上下2列に分けず縦に列挙する。
-    let rows = Layout::vertical(
-        status
-            .temps
-            .iter()
-            .map(|_| Constraint::Length(1))
-            .collect::<Vec<_>>(),
-    )
-    .split(inner);
-    for (i, t) in status.temps.iter().enumerate() {
-        if i >= rows.len() {
-            let hidden = status.temps.len() - rows.len();
-            if let Some(last) = rows.last() {
-                f.render_widget(
-                    Paragraph::new(Line::from(Span::styled(
-                        format!(" … +{hidden} more"),
-                        Style::default().fg(Color::DarkGray),
-                    ))),
-                    *last,
-                );
-            }
-            break;
-        }
+    // Layout::split は制約と同じ数の Rect を返すため
+    // 切詰には使えない。高さから手動で切り、収まらない分は
+    // インジケータを出す（draw_fans と同じ方式）。
+    let visible = inner.height as usize;
+    let total = status.temps.len();
+    // 溢れる場合は最終行をインジケータに使う
+    let shown = if total > visible {
+        visible.saturating_sub(1)
+    } else {
+        total
+    };
+    for (i, t) in status.temps.iter().take(shown).enumerate() {
+        let row = Rect {
+            y: inner.y + i as u16,
+            height: 1,
+            ..inner
+        };
         let key = format!("{}/{}", t.chip, t.label);
         let hist: Vec<u64> = app
             .temp_history
@@ -607,7 +624,7 @@ fn draw_temps(f: &mut Frame, app: &App, area: Rect) {
             Constraint::Length(7),
             Constraint::Min(10),
         ])
-        .split(rows[i]);
+        .split(row);
         f.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled(
@@ -636,6 +653,20 @@ fn draw_temps(f: &mut Frame, app: &App, area: Rect) {
                 .max(1000)
                 .style(Style::default().fg(color)),
             cells[2],
+        );
+    }
+    if shown < total && visible > 0 {
+        let row = Rect {
+            y: inner.y + shown as u16,
+            height: 1,
+            ..inner
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!(" … +{} more", total - shown),
+                Style::default().fg(Color::DarkGray),
+            ))),
+            row,
         );
     }
 }
@@ -845,8 +876,8 @@ mod tests {
         assert!(app.quit);
     }
 
-    #[tokio::test]
-    async fn esc_quits_and_dialog_cancel() {
+    #[test]
+    fn esc_quits_and_dialog_cancel() {
         let mut app = test_app();
         handle_key(&mut app, KeyCode::Char('f'), KeyModifiers::NONE);
         assert!(app.pwm_dialog.is_some());
@@ -856,8 +887,8 @@ mod tests {
         assert!(app.quit);
     }
 
-    #[tokio::test]
-    async fn dialog_uses_config_bounds() {
+    #[test]
+    fn dialog_uses_config_bounds() {
         let (tx, rx) = mpsc::unbounded_channel();
         let mut app = App::new(
             PathBuf::from("/x.sock"),
