@@ -25,12 +25,18 @@ const MAX_REQUEST_BYTES: u64 = 16 * 1024;
 
 /// socket を bind し、権限を設定する。`READY=1` より先に完了させる
 /// ため、serve の spawn 前に呼ぶ。
+///
+/// 親ディレクトリの権限・グループは、この関数が自ら作成した
+/// 場合にのみ変更する（`--socket` で既存ディレクトリ
+/// （例: /tmp）を指されても、その属性を勝手に変えない）。
 pub fn bind(path: &Path) -> std::io::Result<UnixListener> {
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o750))?;
-        // socket 同様に pmgfan グループで通過できるようにする
-        chown_to_group(dir);
+        if !dir.as_os_str().is_empty() && !dir.exists() {
+            std::fs::create_dir_all(dir)?;
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o750))?;
+            // socket 同様に pmgfan グループで通過できるようにする
+            chown_to_group(dir);
+        }
     }
     let _ = std::fs::remove_file(path); // stale socket
     let listener = UnixListener::bind(path)?;
@@ -136,5 +142,48 @@ async fn dispatch<B: FanControlBackend>(
                 Err(e) => Response::Error { error: e },
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// 既存ディレクトリの権限を bind が勝手に変えないこと
+    /// （`--socket /tmp/x.sock` で /tmp が 0750 になる事故の防止）。
+    #[tokio::test]
+    async fn bind_preserves_existing_dir_permissions() {
+        let dir = std::env::temp_dir().join(format!("pmgfan-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let sock = dir.join("control.sock");
+        let _listener = bind(&sock).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o755,
+            "bind must not chmod a pre-existing parent dir"
+        );
+        assert_eq!(
+            std::fs::metadata(&sock).unwrap().permissions().mode() & 0o777,
+            0o660
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 自分が作成したディレクトリには権限を設定する
+    #[tokio::test]
+    async fn bind_sets_permissions_on_created_dir() {
+        let dir = std::env::temp_dir().join(format!("pmgfan-test-new-{}", std::process::id()));
+        let sock = dir.join("control.sock");
+        let _listener = bind(&sock).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o750
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

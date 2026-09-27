@@ -16,7 +16,7 @@ use pmgfan_core::sensor::{self, TempReading};
 use pmgfan_ipmi::backend::FanControlBackend;
 use pmgfan_ipmi::fujitsu;
 use tokio::net::UnixDatagram;
-use tokio::sync::{Mutex, Notify, RwLock};
+use tokio::sync::{watch, Mutex, RwLock};
 use tokio::time::{interval, MissedTickBehavior};
 use tracing::{error, info, warn};
 
@@ -67,6 +67,10 @@ pub struct Shared {
     pub temp_failures: u32,
     /// 書き込み系の連続失敗
     pub write_failures: u32,
+    /// `clear_override` が未達。`pwm=None` だが実際の強制状態が
+    /// 不明なことを示し、mode が IrmcAuto の間制御ループが
+    /// 解除を再試行する
+    pub clear_pending: bool,
     /// 最後にファン読み取りが成功した時刻（watchdog の鮮度判定用）
     pub last_poll_ok: Instant,
     pub started: Instant,
@@ -85,6 +89,7 @@ impl Shared {
             fan_failures: 0,
             temp_failures: 0,
             write_failures: 0,
+            clear_pending: false,
             last_poll_ok: Instant::now(),
             started: Instant::now(),
         }
@@ -97,6 +102,25 @@ fn normal_state(mode: &Mode) -> DaemonState {
         Mode::IrmcAuto => DaemonState::Monitoring,
         _ => DaemonState::Controlling,
     }
+}
+
+/// 失敗カウンタ・clear_pending から `state` を再計算する。
+/// どれか一つでも閾値超過・clear 未達なら `Degraded`。
+/// `Failsafe`（緊急温度）は制御ループが管理するため、
+/// ここでは触らない（現状維持）。
+fn refresh_state(s: &mut Shared, failure_limit: u32) {
+    if s.state == DaemonState::Failsafe {
+        return;
+    }
+    let degraded = s.fan_failures >= failure_limit
+        || s.temp_failures >= failure_limit
+        || s.write_failures >= failure_limit
+        || s.clear_pending;
+    s.state = if degraded {
+        DaemonState::Degraded
+    } else {
+        normal_state(&s.mode)
+    };
 }
 
 /// デーモンを起動し、シャットダウンまでブロックする。
@@ -134,20 +158,21 @@ where
     // override が残る」ことを防ぐ。
     let ctrl = Arc::new(Mutex::new(()));
 
-    // 終了通知。制御ループはこれを見て現在の処理を完了してから返る
-    // （abort すると ipmitool 子プロセスが孤児になり、clear 後に
-    // 強制値が着地する可能性があるため graceful にする）。
-    let shutdown = Arc::new(Notify::new());
+    // 終了通知（watch = ラッチ付き。送った後に受信側が
+    // notified を待ち始めても見逃さない。abort すると ipmitool
+    // 子プロセスが孤児になり clear 後に強制値が着地する可能性
+    // があるため、制御ループは graceful に終わらせる）。
+    let (sd_tx, sd_rx) = watch::channel(false);
 
     // ファン RPM ポーリング
     let poll_fans = {
         let backend = Arc::clone(&backend);
         let shared = Arc::clone(&shared);
-        let shutdown = Arc::clone(&shutdown);
+        let shutdown = sd_rx.clone();
         let fan_interval = params.fan_interval;
         let limit = params.ipmi_failure_limit;
         tokio::spawn(async move {
-            poll_fans_loop(&*backend, &shared, &shutdown, fan_interval, limit).await
+            poll_fans_loop(&*backend, &shared, shutdown, fan_interval, limit).await
         })
     };
 
@@ -155,11 +180,11 @@ where
     let poll_temps = {
         let backend = Arc::clone(&backend);
         let shared = Arc::clone(&shared);
-        let shutdown = Arc::clone(&shutdown);
+        let shutdown = sd_rx.clone();
         let temp_interval = params.temp_interval;
         let limit = params.ipmi_failure_limit;
         tokio::spawn(async move {
-            poll_temps_loop(&*backend, &shared, &shutdown, temp_interval, limit).await
+            poll_temps_loop(&*backend, &shared, shutdown, temp_interval, limit).await
         })
     };
 
@@ -168,7 +193,6 @@ where
         let backend = Arc::clone(&backend);
         let shared = Arc::clone(&shared);
         let ctrl = Arc::clone(&ctrl);
-        let shutdown = Arc::clone(&shutdown);
         let apply_interval = params.apply_interval;
         let control_params = params.control;
         let curves = params.curves.clone();
@@ -179,7 +203,7 @@ where
                 &*backend,
                 &shared,
                 &ctrl,
-                &shutdown,
+                sd_rx,
                 control_params,
                 &curves,
                 apply_interval,
@@ -225,6 +249,8 @@ where
         if let Err(e) = backend.clear_override().await {
             warn!(error = %e, "startup clear_override failed");
             let mut s = shared.write().await;
+            // 解除未達を記録し、制御ループの IrmcAuto リトライに委ねる
+            s.clear_pending = true;
             s.state = DaemonState::Degraded;
             s.last_error = Some(e.to_string());
         }
@@ -254,7 +280,7 @@ where
     // シャットダウン: 制御ループに終了を通知し、in-flight の
     // 書き込みが完了するのを待ってから override を解除する。
     info!("shutting down; clearing OEM override");
-    shutdown.notify_waiters();
+    let _ = sd_tx.send(true);
     if tokio::time::timeout(SHUTDOWN_JOIN_TIMEOUT, &mut control)
         .await
         .is_err()
@@ -285,7 +311,7 @@ where
 async fn poll_fans_loop<B: FanControlBackend>(
     backend: &B,
     shared: &RwLock<Shared>,
-    shutdown: &Notify,
+    mut shutdown: watch::Receiver<bool>,
     poll_interval: Duration,
     failure_limit: u32,
 ) {
@@ -294,7 +320,10 @@ async fn poll_fans_loop<B: FanControlBackend>(
     loop {
         tokio::select! {
             _ = tick.tick() => {}
-            _ = shutdown.notified() => return,
+            _ = shutdown.changed() => {}
+        }
+        if *shutdown.borrow() {
+            return;
         }
         // IPMI 呼び出しはロックの外で行い、結果のコミットだけ
         // ロックを取る（ロック越し IO は解除操作をブロックする）。
@@ -305,18 +334,19 @@ async fn poll_fans_loop<B: FanControlBackend>(
                 s.fans = fans;
                 s.fan_failures = 0;
                 s.last_poll_ok = Instant::now();
-                s.last_error = None;
-                if s.state == DaemonState::Degraded {
-                    s.state = normal_state(&s.mode);
+                refresh_state(&mut s, failure_limit);
+                // 他ドメインの診断を消さないよう、健全な場合だけクリア
+                if s.state != DaemonState::Degraded {
+                    s.last_error = None;
                 }
             }
             Err(e) => {
                 s.fan_failures += 1;
                 s.last_error = Some(e.to_string());
                 if s.fan_failures >= failure_limit {
-                    s.state = DaemonState::Degraded;
                     warn!(failures = s.fan_failures, error = %e, "ipmi fan polling failing");
                 }
+                refresh_state(&mut s, failure_limit);
             }
         }
     }
@@ -325,7 +355,7 @@ async fn poll_fans_loop<B: FanControlBackend>(
 async fn poll_temps_loop<B: FanControlBackend>(
     backend: &B,
     shared: &RwLock<Shared>,
-    shutdown: &Notify,
+    mut shutdown: watch::Receiver<bool>,
     poll_interval: Duration,
     failure_limit: u32,
 ) {
@@ -334,10 +364,16 @@ async fn poll_temps_loop<B: FanControlBackend>(
     loop {
         tokio::select! {
             _ = tick.tick() => {}
-            _ = shutdown.notified() => return,
+            _ = shutdown.changed() => {}
+        }
+        if *shutdown.borrow() {
+            return;
         }
         let result = backend.temperatures().await;
-        let hw = read_hwmon();
+        // sysfs 同期読み取りはランタイムスレッドを塞がないよう別スレッドへ
+        let hw = tokio::task::spawn_blocking(read_hwmon)
+            .await
+            .unwrap_or_default();
         let mut s = shared.write().await;
         match result {
             Ok(mut temps) => {
@@ -349,12 +385,11 @@ async fn poll_temps_loop<B: FanControlBackend>(
                 // IPMI 温度が取れなくても hwmon だけは更新する
                 s.temps = hw;
                 s.temp_failures += 1;
-                if s.temp_failures >= failure_limit {
-                    s.state = DaemonState::Degraded;
-                }
                 warn!(failures = s.temp_failures, error = %e, "ipmi temperature read failed");
+                s.last_error = Some(e.to_string());
             }
         }
+        refresh_state(&mut s, failure_limit);
     }
 }
 
@@ -377,7 +412,7 @@ async fn control_loop<B: FanControlBackend>(
     backend: &B,
     shared: &RwLock<Shared>,
     ctrl: &Mutex<()>,
-    shutdown: &Notify,
+    mut shutdown: watch::Receiver<bool>,
     params: ControlParams,
     curves: &[Curve],
     apply_interval: Duration,
@@ -389,23 +424,28 @@ async fn control_loop<B: FanControlBackend>(
     let mut seen_gen = 0u64;
     let mut ticks_since_write = 0u32;
     let mut missing_sensors: Vec<String> = Vec::new();
+    let mut emergency_active = false;
     let mut tick = interval(apply_interval);
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     loop {
         tokio::select! {
             _ = tick.tick() => {}
-            _ = shutdown.notified() => return,
+            _ = shutdown.changed() => {}
+        }
+        if *shutdown.borrow() {
+            return;
         }
         // PWM 操作は apply_mode の即時解除と直列化する
         let _ctrl = ctrl.lock().await;
-        let (mode, gen, temps, applied_pwm) = {
+        let (mode, gen, temps, applied_pwm, clear_pending) = {
             let s = shared.read().await;
             (
                 s.mode.clone(),
                 s.mode_generation,
                 s.temps.clone(),
                 s.pwm,
+                s.clear_pending,
             )
         };
         if gen != seen_gen {
@@ -421,6 +461,7 @@ async fn control_loop<B: FanControlBackend>(
 
         // 緊急温度: モードに関わらず 100% 強制が最優先
         if let Some((sensor_name, t)) = emergency_check(&temps, cpu_emergency, pch_emergency) {
+            emergency_active = true;
             warn!(sensor = %sensor_name, temp = t, "emergency temperature; forcing 100% pwm");
             write_pwm(backend, shared, EMERGENCY_PWM, failure_limit).await;
             let mut s = shared.write().await;
@@ -428,9 +469,59 @@ async fn control_loop<B: FanControlBackend>(
             s.last_error = Some(format!("emergency: {sensor_name} {t:.1}C"));
             continue;
         }
+        if emergency_active {
+            // 緊急解除後の復帰。Auto モードでは 100% 強制が残らない
+            // よう解除して Monitoring へ戻す。強制系は 100% を
+            // 起点に滑らかに下げる
+            emergency_active = false;
+            info!("emergency cleared; restoring normal control");
+            if mode == Mode::IrmcAuto {
+                match backend.clear_override().await {
+                    Ok(()) => {
+                        let mut s = shared.write().await;
+                        s.pwm = None;
+                        s.clear_pending = false;
+                        s.state = DaemonState::Monitoring;
+                        s.last_error = None;
+                    }
+                    Err(e) => {
+                        let mut s = shared.write().await;
+                        s.clear_pending = true;
+                        s.write_failures += 1;
+                        s.last_error = Some(e.to_string());
+                        s.state = DaemonState::Degraded;
+                        error!(error = %e, "post-emergency clear failed; will retry");
+                    }
+                }
+            } else {
+                limiter.prime(EMERGENCY_PWM);
+            }
+        }
 
         match mode {
-            Mode::IrmcAuto => {}
+            Mode::IrmcAuto => {
+                // clear が未達なら再試行する（pwm=None 表示のまま
+                // 強制が残る状態を放置しない）
+                if clear_pending {
+                    match backend.clear_override().await {
+                        Ok(()) => {
+                            let mut s = shared.write().await;
+                            s.clear_pending = false;
+                            s.pwm = None;
+                            s.state = DaemonState::Monitoring;
+                            s.last_error = None;
+                            info!("override cleared (retry)");
+                        }
+                        Err(e) => {
+                            let mut s = shared.write().await;
+                            s.write_failures += 1;
+                            s.last_error = Some(e.to_string());
+                            s.state = DaemonState::Degraded;
+                            warn!(error = %e, "clear_override retry failed");
+                        }
+                    }
+                }
+            }
             Mode::FixedPwm(p) => {
                 // 外部要因で解除される可能性に備え周期再アサート。
                 // ただし値が変わった tick で即時書き込み、変わらなければ
@@ -461,10 +552,15 @@ async fn control_loop<B: FanControlBackend>(
                         if needs_clear {
                             warn!("no curve sensors readable; clearing override (iRMC auto)");
                             match backend.clear_override().await {
-                                Ok(()) => shared.write().await.pwm = None,
+                                Ok(()) => {
+                                    let mut s = shared.write().await;
+                                    s.pwm = None;
+                                    s.clear_pending = false;
+                                }
                                 Err(e) => {
                                     let mut s = shared.write().await;
                                     s.write_failures += 1;
+                                    s.clear_pending = true;
                                     s.last_error = Some(e.to_string());
                                     error!(error = %e, "clear_override failed; will retry");
                                 }
@@ -530,9 +626,14 @@ async fn write_pwm<B: FanControlBackend>(
         Ok(()) => {
             let mut s = shared.write().await;
             s.pwm = Some(pwm);
-            s.state = normal_state(&s.mode);
+            // 強制状態が既知になったので解除未達フラグも降ろす
+            s.clear_pending = false;
             s.write_failures = 0;
-            s.last_error = None;
+            refresh_state(&mut s, failure_limit);
+            // 他ドメインの診断を消さないよう、健全な場合だけクリア
+            if s.state != DaemonState::Degraded {
+                s.last_error = None;
+            }
         }
         Err(e) => {
             let mut s = shared.write().await;
@@ -590,6 +691,7 @@ pub async fn apply_mode<B: FanControlBackend>(
             if let Err(e) = backend.clear_override().await {
                 let mut s = shared.write().await;
                 s.write_failures += 1;
+                s.clear_pending = true;
                 s.last_error = Some(e.to_string());
                 return Err(e.to_string());
             }
@@ -597,6 +699,7 @@ pub async fn apply_mode<B: FanControlBackend>(
             s.mode = Mode::IrmcAuto;
             s.mode_generation += 1;
             s.pwm = None;
+            s.clear_pending = false;
             s.state = DaemonState::Monitoring;
             info!("mode -> irmc_auto");
             Ok(())
@@ -662,7 +765,9 @@ fn spawn_watchdog(shared: Arc<RwLock<Shared>>) {
         return;
     }
     let period = Duration::from_micros(usec);
-    let half = period / 2;
+    // WATCHDOG_USEC が極小だと half が 0 になり interval が
+    // panic するのを防ぐ
+    let half = (period / 2).max(Duration::from_millis(100));
     tokio::spawn(async move {
         let mut t = interval(half);
         loop {
@@ -814,11 +919,49 @@ mod tests {
             .await
             .is_err());
         let s = s.read().await;
-        // 失敗時はモード・pwm を変えない（診断だけ残す）
+        // 失敗時はモード・pwm を変えない（診断だけ残す）。
+        // 解除未達を記録して制御ループのリトライに委ねる
         assert_eq!(s.mode, Mode::Curve);
         assert_eq!(s.pwm, Some(40));
+        assert!(s.clear_pending);
         assert_eq!(s.write_failures, 1);
         assert!(s.last_error.is_some());
+    }
+
+    #[tokio::test]
+    async fn write_pwm_clears_pending_flag() {
+        let b = MockBackend::new();
+        let s = shared_with_mode(Mode::FixedPwm(40));
+        s.write().await.clear_pending = true;
+        write_pwm(&b, &s, 40, 3).await;
+        let s = s.read().await;
+        assert_eq!(s.pwm, Some(40));
+        assert!(!s.clear_pending);
+        assert_eq!(s.state, DaemonState::Controlling);
+    }
+
+    #[test]
+    fn refresh_state_tracks_all_failure_domains() {
+        // 失敗ドメインのいずれかが閾値超過なら Degraded、
+        // 全部健全になって初めて normal に戻る（フラッピング防止）
+        let mut s = Shared::new(Mode::Curve);
+        s.state = DaemonState::Degraded;
+        s.temp_failures = 3;
+        s.fan_failures = 0;
+        refresh_state(&mut s, 3);
+        assert_eq!(s.state, DaemonState::Degraded); // まだ閾値超過
+        s.temp_failures = 0;
+        s.clear_pending = true;
+        refresh_state(&mut s, 3);
+        assert_eq!(s.state, DaemonState::Degraded); // clear 未達も Degraded
+        s.clear_pending = false;
+        refresh_state(&mut s, 3);
+        assert_eq!(s.state, DaemonState::Controlling); // 全解消で回復
+        // Failsafe（緊急温度）はここでは上書きしない
+        s.state = DaemonState::Failsafe;
+        s.fan_failures = 0;
+        refresh_state(&mut s, 3);
+        assert_eq!(s.state, DaemonState::Failsafe);
     }
 
     #[tokio::test]

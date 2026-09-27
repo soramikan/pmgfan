@@ -36,17 +36,26 @@ daemon shutdown
   （`state = Degraded`）。解除失敗時は次 tick で再試行する
 - **緊急温度**: `cpu_emergency` / `pch_emergency` 超過時は
   モードに関わらず 100% PWM を強制し `state = Failsafe` へ
-  （docs/03 のカーブ誤設定に対する最後の砦）
+  （docs/03 のカーブ誤設定に対する最後の砦）。温度が閾値を
+  下回ると通常制御に復帰する。Auto モード中の発動では
+  復帰時に `clear_override` して Monitoring に戻る
+- **iRMC Auto の解除未達追跡**: Auto 起動時や `set_mode` の
+  `clear_override` が失敗すると `clear_pending` を立て、
+  mode が Auto の間制御ループが解除を再試行する
+  （`state = Degraded` で未達を可視化。
+  「Auto 表示だが強制が残っている」状態を放置しない）
 - **IPMI 連続失敗**: 読み取り（fan/temp）・書き込み系の
   連続失敗がそれぞれ `ipmi_failure_limit`（既定3）に達すると
-  `state = Degraded`。回復時はモードに応じた状態へ戻る
+  `state = Degraded`。回復は全ドメインが健全になった時のみ
+  （ドメイン間で状態が振動しない）
 - **機種検証**: 起動時に FRU の Product Name を `device.model`
   と照合し、不一致・取得失敗では起動しない（fail-closed）
 - **モード変更の直列化**: `apply_mode` の iRMC Auto 即時解除と
   制御ループの PWM 書き込みは同一ミューテックスで直列化し、
   「Auto 表示なのに override が残る」レースを防ぐ
-- **daemon shutdown**: SIGTERM/SIGINT で制御ループに終了を通知
-  → in-flight の書き込み完了を待機 → `clear_override` を実行
+- **daemon shutdown**: SIGTERM/SIGINT でラッチ付き通知
+  （watch channel）を制御ループへ送り、in-flight の書き込み
+  完了を待機（5s 超過時のみ abort）→ `clear_override` を実行
   してから終了（実機検証済み）
 - **タスク死亡**: 監視・制御・IPC のいずれかが終了した場合、
   shutdown 処理のあと非0終了し `Restart=on-failure` に委ねる
@@ -54,7 +63,8 @@ daemon shutdown
   ハングした子プロセスがループを塞がないようにする
 - **不正設定**: `mode = "curve"` で `[[curve]]` 未定義、
   `mode = "fixed_pwm"` で `fixed_pwm` 未指定/範囲外、
-  `min_pwm < 30` や `min > max`、昇順でないカーブ点などは
+  `min_pwm < 30` や `min > max`、昇順でないカーブ点、
+  空の `device.model`、非有限・範囲外の緊急温度などは
   起動時にエラー終了
 
 未実装: `sensor_stale_seconds`（センサー陳腐化検出）、

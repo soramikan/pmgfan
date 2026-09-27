@@ -102,8 +102,13 @@ async fn main() -> Result<()> {
             daemon::run(backend, params).await
         }
         cmd => {
-            let backend =
-                IpmitoolBackend::new(bin, cli_iface.unwrap_or_else(|| "open".into()));
+            // 単発コマンドでも --config の [device].interface を使う
+            // （-I 指定が最優先）
+            let cfg_iface = load_config_interface(cli.config.as_deref())?;
+            let backend = IpmitoolBackend::new(
+                bin,
+                cli_iface.or(cfg_iface).unwrap_or_else(|| "open".into()),
+            );
             match cmd {
                 Cmd::Probe => probe(&backend).await,
                 Cmd::Fans => {
@@ -166,6 +171,20 @@ async fn main() -> Result<()> {
     }
 }
 
+/// `--config` が指定されている場合だけ設定を読み、
+/// `[device].interface` を返す（単発コマンド向けの軽量読み込み。
+/// デーモン用の全検証は `build_params` が行う）。
+fn load_config_interface(config_path: Option<&Path>) -> Result<Option<String>> {
+    let Some(path) = config_path else {
+        return Ok(None);
+    };
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("cannot read config {}", path.display()))?;
+    let config: Config =
+        toml::from_str(&text).with_context(|| format!("invalid TOML in {}", path.display()))?;
+    Ok(Some(config.device.interface))
+}
+
 /// `--config`（あれば読み込み、なければ既定値）から
 /// `daemon::Params` と ipmitool インターフェース名を構築する。
 ///
@@ -212,6 +231,19 @@ fn build_params(config_path: Option<&Path>, socket: PathBuf) -> Result<(daemon::
     }
     if config.safety.ipmi_failure_limit == 0 {
         bail!("[safety] ipmi_failure_limit must be >= 1");
+    }
+    // 機種照合は空文字だと contains() が常に真となり
+    // 検証が無効化されるため拒否する
+    if config.device.model.trim().is_empty() {
+        bail!("[device] model must not be empty");
+    }
+    for (key, v) in [
+        ("cpu_emergency", config.safety.cpu_emergency),
+        ("pch_emergency", config.safety.pch_emergency),
+    ] {
+        if !v.is_finite() || !(0.0..=150.0).contains(&v) {
+            bail!("[safety] {key} must be a finite temperature in 0..=150 (got {v})");
+        }
     }
 
     let startup_mode = match cc.mode.as_str() {
