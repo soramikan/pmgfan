@@ -7,13 +7,18 @@ TUI だけだと SSH スクリプト等から操作しにくいため、
 ## コマンド
 
 ```bash
-pmgfanctl                 # TUI を起動
+pmgfanctl                 # TTY なら TUI、パイプなら status
+pmgfanctl tui             # TUI を明示起動
 pmgfanctl status          # 状態表示
 pmgfanctl auto            # iRMC Auto へ戻す
 pmgfanctl pwm 40          # Fixed PWM 40%
-pmgfanctl rpm "FAN CPU" 2500   # Target RPM
+pmgfanctl rpm "FAN CPU" 2500   # Target RPM（Phase 7）
 pmgfanctl mode curve      # ファンカーブ制御
 ```
+
+TUI のカーブ表示は `--config <path>` で読んだ `[[curve]]`
+定義を使う（既定 `/etc/pmgfand/config.toml`）。読めない場合は
+カーブパネル自体を出さない。
 
 ## `status` 出力例
 

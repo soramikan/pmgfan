@@ -1,10 +1,12 @@
-//! pmgfanctl — pmgfand の CLI/TUI クライアント（Phase 2: CLI のみ）。
+//! pmgfanctl — pmgfand の CLI/TUI クライアント。
 //!
 //! Unix socket 経由で pmgfand を操作する。root 不要
 //! （`pmgfan` グループに所属していればよい）。
 
 mod client;
+mod tui;
 
+use std::io::IsTerminal;
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -15,12 +17,16 @@ use pmgfan_core::protocol::{Mode, Request, Response};
 #[command(
     name = "pmgfanctl",
     version,
-    about = "pmgfand control client (CLI; TUI arrives in a later phase)"
+    about = "pmgfand control client (CLI / TUI)"
 )]
 struct Cli {
     /// 制御 socket のパス
     #[arg(long, global = true, default_value_os_t = PathBuf::from(pmgfan_core::protocol::DEFAULT_SOCKET_PATH))]
     socket: PathBuf,
+    /// TUI のカーブ表示に使う設定ファイル
+    /// （既定: pmgfand と同じ /etc/pmgfand/config.toml）
+    #[arg(long, global = true, default_value_os_t = PathBuf::from("/etc/pmgfand/config.toml"))]
+    config: PathBuf,
     #[command(subcommand)]
     cmd: Option<Cmd>,
 }
@@ -29,6 +35,8 @@ struct Cli {
 enum Cmd {
     /// 状態表示（省略時のデフォルト）
     Status,
+    /// 監視・操作用 TUI を起動する
+    Tui,
     /// iRMC Auto（OEM override 解除）へ戻す
     Auto,
     /// 全 PWM チャンネルを % 固定する
@@ -57,7 +65,17 @@ async fn main() -> Result<()> {
     // 静かに終了させる（head 等との組み合わせ対策）。
     unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
     let cli = Cli::parse();
-    match cli.cmd.unwrap_or(Cmd::Status) {
+    // 引数なし: 端末付きなら TUI、パイプ等なら status
+    // （スクリプトからの出力を壊さない）
+    let cmd = cli.cmd.unwrap_or_else(|| {
+        if std::io::stdout().is_terminal() {
+            Cmd::Tui
+        } else {
+            Cmd::Status
+        }
+    });
+    match cmd {
+        Cmd::Tui => tui::run(&cli.socket, Some(&cli.config)).await,
         Cmd::Status => {
             let resp = client::request(&cli.socket, &Request::GetStatus).await?;
             match resp {
