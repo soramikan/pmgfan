@@ -4,7 +4,10 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::io::stdout;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -24,22 +27,35 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::canvas::{Canvas, Line as CanvasLine, Points};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Sparkline};
 use ratatui::{Frame, Terminal};
+use tokio::signal::unix::{signal, SignalKind};
+use tokio::sync::mpsc;
 
 use crate::client;
 
 /// 状態ポーリング間隔。
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
+/// ポーリング要求のタイムアウト（応答タスク側。ループはブロックしない）。
+const POLL_TIMEOUT: Duration = Duration::from_secs(5);
+/// モード変更要求のタイムアウト。
+const REQ_TIMEOUT: Duration = Duration::from_secs(10);
 /// キー入力待ちの上限（これにより描画が周期的に回る）。
 const TICK: Duration = Duration::from_millis(100);
 /// 温度スパークラインの保持サンプル数。
 const HISTORY_LEN: usize = 180;
 /// notice の表示時間。
 const NOTICE_TTL: Duration = Duration::from_secs(4);
-/// Fixed PWM ダイアログの下限（daemon 側既定と同じ）。
-const DIALOG_MIN_PWM: u8 = 30;
+/// Fixed PWM ダイアログの下限/上限デフォルト（config 未指定時。
+/// daemon 側既定 30 / 物理上限 100 に合わせる）。
+const DEFAULT_PWM_MIN: u8 = 30;
+const DEFAULT_PWM_MAX: u8 = 100;
+/// 描画に必要な最小端末サイズ。
+const MIN_WIDTH: u16 = 50;
+const MIN_HEIGHT: u16 = 22;
+/// カーブパネルを出すのに必要な高さ。
+const CURVE_MIN_HEIGHT: u16 = 32;
 
 /// 最後に取得したデーモン状態。
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct Status {
     state: DaemonState,
     mode: Mode,
@@ -49,9 +65,18 @@ struct Status {
     uptime_secs: f64,
 }
 
+/// バックグラウンド要求タスクからの結果。
+enum Outcome {
+    Status(Result<Status, String>),
+    ModeSet { label: String, result: Result<(), String> },
+}
+
 struct App {
     socket: PathBuf,
     curves: Vec<Curve>,
+    /// Fixed PWM ダイアログの下限/上限（config の control.* 由来）。
+    pwm_min: u8,
+    pwm_max: u8,
     status: Option<Status>,
     conn_error: Option<String>,
     /// `chip/label` → 温度履歴
@@ -59,19 +84,35 @@ struct App {
     pwm_dialog: Option<u8>,
     notice: Option<(Instant, String)>,
     quit: bool,
+    tx: mpsc::UnboundedSender<Outcome>,
+    rx: mpsc::UnboundedReceiver<Outcome>,
+    /// ポーリング要求が飛行中か（多重ポーリング防止）。
+    poll_inflight: bool,
 }
 
 impl App {
-    fn new(socket: PathBuf, curves: Vec<Curve>) -> Self {
+    fn new(
+        socket: PathBuf,
+        curves: Vec<Curve>,
+        pwm_min: u8,
+        pwm_max: u8,
+        tx: mpsc::UnboundedSender<Outcome>,
+        rx: mpsc::UnboundedReceiver<Outcome>,
+    ) -> Self {
         Self {
             socket,
             curves,
+            pwm_min,
+            pwm_max,
             status: None,
             conn_error: None,
             temp_history: HashMap::new(),
             pwm_dialog: None,
             notice: None,
             quit: false,
+            tx,
+            rx,
+            poll_inflight: false,
         }
     }
 
@@ -79,77 +120,176 @@ impl App {
         self.notice = Some((Instant::now(), msg.into()));
     }
 
-    async fn refresh(&mut self) {
-        match client::request(&self.socket, &Request::GetStatus).await {
-            Ok(Response::Status {
-                state,
-                mode,
-                pwm,
-                fans,
-                temperatures,
-                uptime_secs,
-            }) => {
-                self.conn_error = None;
-                for t in &temperatures {
-                    let key = format!("{}/{}", t.chip, t.label);
-                    let hist = self.temp_history.entry(key).or_default();
-                    hist.push_back((t.celsius * 10.0) as u64);
-                    while hist.len() > HISTORY_LEN {
-                        hist.pop_front();
-                    }
-                }
-                self.status = Some(Status {
+    /// 状態ポーリングをバックグラウンドで開始する。
+    /// イベントループをブロックしない。
+    fn spawn_refresh(&mut self) {
+        self.poll_inflight = true;
+        let socket = self.socket.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let r = tokio::time::timeout(
+                POLL_TIMEOUT,
+                client::request(&socket, &Request::GetStatus),
+            )
+            .await;
+            let outcome = match r {
+                Ok(Ok(Response::Status {
+                    state,
+                    mode,
+                    pwm,
+                    fans,
+                    temperatures,
+                    uptime_secs,
+                })) => Outcome::Status(Ok(Status {
                     state,
                     mode,
                     pwm,
                     fans,
                     temps: temperatures,
                     uptime_secs,
+                })),
+                Ok(Ok(Response::Error { error })) => Outcome::Status(Err(error)),
+                Ok(Ok(_)) => Outcome::Status(Err("unexpected response".into())),
+                Ok(Err(e)) => Outcome::Status(Err(e.to_string())),
+                Err(_) => Outcome::Status(Err("request timeout".into())),
+            };
+            let _ = tx.send(outcome);
+        });
+    }
+
+    /// モード変更要求をバックグラウンドで送信する。
+    fn set_mode(&mut self, mode: Mode, label: &str) {
+        let socket = self.socket.clone();
+        let tx = self.tx.clone();
+        let label = label.to_string();
+        tokio::spawn(async move {
+            let r = tokio::time::timeout(
+                REQ_TIMEOUT,
+                client::request(&socket, &Request::SetMode { mode }),
+            )
+            .await;
+            let result = match r {
+                Ok(Ok(resp)) => client::expect_ok(resp).map_err(|e| format!("{e:#}")),
+                Ok(Err(e)) => Err(format!("{e:#}")),
+                Err(_) => Err("request timeout".into()),
+            };
+            let _ = tx.send(Outcome::ModeSet { label, result });
+        });
+    }
+
+    /// 要求タスクの結果を状態へ反映する。
+    fn apply_outcome(&mut self, outcome: Outcome) {
+        match outcome {
+            Outcome::Status(Ok(s)) => {
+                self.poll_inflight = false;
+                self.conn_error = None;
+                // 消えたセンサーの履歴を捨てる
+                self.temp_history.retain(|k, _| {
+                    s.temps.iter().any(|t| format!("{}/{}", t.chip, t.label) == *k)
                 });
+                for t in &s.temps {
+                    if !t.celsius.is_finite() {
+                        continue;
+                    }
+                    let key = format!("{}/{}", t.chip, t.label);
+                    let hist = self.temp_history.entry(key).or_default();
+                    hist.push_back((t.celsius * 10.0).clamp(0.0, 1000.0) as u64);
+                    while hist.len() > HISTORY_LEN {
+                        hist.pop_front();
+                    }
+                }
+                self.status = Some(s);
             }
-            Ok(_) => self.conn_error = Some("unexpected response".into()),
-            Err(e) => self.conn_error = Some(e.to_string()),
+            Outcome::Status(Err(e)) => {
+                self.poll_inflight = false;
+                self.conn_error = Some(e);
+            }
+            Outcome::ModeSet { label, result } => match result {
+                Ok(()) => {
+                    self.notify(format!("mode applied: {label}"));
+                    // 直後の画面更新のため即座に再ポーリング
+                    if !self.poll_inflight {
+                        self.spawn_refresh();
+                    }
+                }
+                Err(e) => self.notify(e),
+            },
         }
     }
 
-    async fn set_mode(&mut self, mode: Mode, label: &str) {
-        match client::request(&self.socket, &Request::SetMode { mode }).await {
-            Ok(resp) => match client::expect_ok(resp) {
-                Ok(()) => self.notify(format!("mode applied: {label}")),
-                Err(e) => self.notify(format!("{e:#}")),
-            },
-            Err(e) => self.notify(format!("{e:#}")),
+    /// 溜まった Outcome を全て処理する。
+    fn drain_outcomes(&mut self) {
+        while let Ok(o) = self.rx.try_recv() {
+            self.apply_outcome(o);
         }
-        self.refresh().await;
     }
 }
 
 /// TUI を実行する。戻るときは端末を元の状態に復元する。
 pub async fn run(socket: &Path, config_path: Option<&Path>) -> Result<()> {
-    let curves = load_curves(config_path);
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        anyhow::bail!("pmgfanctl tui requires an interactive terminal");
+    }
+    let cfg = load_config(config_path);
+
+    // panic 時は代替画面にメッセージが飲まれないよう、
+    // 端末を復元してから既定フックへ委譲する。
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = disable_raw_mode();
+        let _ = execute!(stdout(), LeaveAlternateScreen);
+        prev_hook(info);
+    }));
 
     enable_raw_mode()?;
+    // この時点以降の失敗・panic はガードの Drop で復元される。
+    let _guard = TerminalGuard;
     let mut out = stdout();
     execute!(out, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(out);
     let mut terminal = Terminal::new(backend)?;
-    let _guard = TerminalGuard;
 
-    let mut app = App::new(socket.to_path_buf(), curves);
-    app.refresh().await;
-    let mut last_poll = Instant::now();
+    // 外部シグナル（kill 等）でもループを抜けて Drop で復元する。
+    let stop = Arc::new(AtomicBool::new(false));
+    for kind in [SignalKind::terminate(), SignalKind::interrupt()] {
+        let stop = stop.clone();
+        tokio::spawn(async move {
+            if let Ok(mut s) = signal(kind) {
+                s.recv().await;
+            }
+            stop.store(true, Ordering::SeqCst);
+        });
+    }
 
-    while !app.quit {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let mut app = App::new(
+        socket.to_path_buf(),
+        cfg.curves,
+        cfg.pwm_min,
+        cfg.pwm_max,
+        tx,
+        rx,
+    );
+    if let Some(e) = cfg.error {
+        app.notify(format!("config: {e}"));
+    }
+
+    // 初回ポーリングはバックグラウンドなので、即座に
+    // "connecting" 画面を描画できる。
+    let mut last_poll = Instant::now() - POLL_INTERVAL;
+
+    while !app.quit && !stop.load(Ordering::SeqCst) {
         terminal.draw(|f| draw(f, &app))?;
         if event::poll(TICK)? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
-                    handle_key(&mut app, key.code, key.modifiers).await;
+                    handle_key(&mut app, key.code, key.modifiers);
                 }
             }
         }
-        if last_poll.elapsed() >= POLL_INTERVAL {
-            app.refresh().await;
+        app.drain_outcomes();
+        if !app.poll_inflight && last_poll.elapsed() >= POLL_INTERVAL {
+            app.spawn_refresh();
             last_poll = Instant::now();
         }
         // 古い notice を消す
@@ -173,48 +313,82 @@ impl Drop for TerminalGuard {
     }
 }
 
-/// 設定ファイルから `[[curve]]` を読み込む（表示専用。
-/// 読めない場合はカーブパネルを出さない）。
-fn load_curves(config_path: Option<&Path>) -> Vec<Curve> {
-    let Some(path) = config_path else {
-        return Vec::new();
-    };
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return Vec::new();
-    };
-    let Ok(config) = toml::from_str::<Config>(&text) else {
-        return Vec::new();
-    };
-    config
-        .curves
-        .iter()
-        .filter_map(|c| Curve::new(c.sensor.clone(), c.points.clone()).ok())
-        .collect()
+/// 設定ファイルから TUI 用の値を読み込む（表示専用。
+/// 読めない場合はデフォルトで動作し、理由は error に入れる）。
+struct TuiConfig {
+    curves: Vec<Curve>,
+    pwm_min: u8,
+    pwm_max: u8,
+    error: Option<String>,
 }
 
-async fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
+fn load_config(config_path: Option<&Path>) -> TuiConfig {
+    let mut cfg = TuiConfig {
+        curves: Vec::new(),
+        pwm_min: DEFAULT_PWM_MIN,
+        pwm_max: DEFAULT_PWM_MAX,
+        error: None,
+    };
+    let Some(path) = config_path else {
+        return cfg;
+    };
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) => {
+            cfg.error = Some(format!("cannot read {}: {e}", path.display()));
+            return cfg;
+        }
+    };
+    match toml::from_str::<Config>(&text) {
+        Ok(config) => {
+            cfg.pwm_min = config.control.min_pwm.max(DEFAULT_PWM_MIN);
+            cfg.pwm_max = config.control.max_pwm.min(100).max(cfg.pwm_min);
+            cfg.curves = config
+                .curves
+                .iter()
+                .filter_map(|c| Curve::new(c.sensor.clone(), c.points.clone()).ok())
+                .collect();
+        }
+        Err(e) => cfg.error = Some(format!("cannot parse {}: {e}", path.display())),
+    }
+    cfg
+}
+
+/// Fixed PWM ダイアログの値を [min, max] に収める。
+fn clamp_pwm(pwm: u8, delta: i8, min: u8, max: u8) -> u8 {
+    pwm.saturating_add_signed(delta).clamp(min.min(max), max)
+}
+
+fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
+    // Ctrl 修飾付き文字キーはモード操作に使わない。
+    // raw mode では Ctrl+C が SIGINT にならず Char('c')+CONTROL
+    // として届くため、誤ってモード変更へ割り当てない。
+    if modifiers.contains(KeyModifiers::CONTROL) {
+        if matches!(code, KeyCode::Char('c') | KeyCode::Char('C')) {
+            app.quit = true;
+        }
+        return;
+    }
+    if modifiers.contains(KeyModifiers::ALT) {
+        return;
+    }
+
     if let Some(pwm) = app.pwm_dialog {
+        let step: i8 = if modifiers.contains(KeyModifiers::SHIFT) {
+            5
+        } else {
+            1
+        };
         match code {
             KeyCode::Left => {
-                let step = if modifiers.contains(KeyModifiers::SHIFT) {
-                    5
-                } else {
-                    1
-                };
-                app.pwm_dialog = Some(pwm.saturating_sub(step).max(DIALOG_MIN_PWM));
+                app.pwm_dialog = Some(clamp_pwm(pwm, -step, app.pwm_min, app.pwm_max))
             }
             KeyCode::Right => {
-                let step = if modifiers.contains(KeyModifiers::SHIFT) {
-                    5
-                } else {
-                    1
-                };
-                app.pwm_dialog = Some(pwm.saturating_add(step).min(100));
+                app.pwm_dialog = Some(clamp_pwm(pwm, step, app.pwm_min, app.pwm_max))
             }
             KeyCode::Enter => {
                 app.pwm_dialog = None;
-                app.set_mode(Mode::FixedPwm(pwm), &format!("fixed PWM {pwm}%"))
-                    .await;
+                app.set_mode(Mode::FixedPwm(pwm), &format!("fixed PWM {pwm}%"));
             }
             KeyCode::Esc => app.pwm_dialog = None,
             _ => {}
@@ -223,56 +397,70 @@ async fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
     }
 
     match code {
-        KeyCode::Char('q') | KeyCode::Esc => app.quit = true,
-        KeyCode::Char('a') => app.set_mode(Mode::IrmcAuto, "iRMC Auto").await,
-        KeyCode::Char('c') => app.set_mode(Mode::Curve, "Curve").await,
-        KeyCode::Char('f') => {
-            let seed = app
-                .status
-                .as_ref()
-                .and_then(|s| match s.mode {
-                    Mode::FixedPwm(p) => Some(p),
-                    _ => s.pwm,
-                })
-                .unwrap_or(40);
-            app.pwm_dialog = Some(seed.max(DIALOG_MIN_PWM));
-        }
-        KeyCode::Char('r') => {
-            app.notify("target RPM mode is not implemented yet (phase 7)")
-        }
-        KeyCode::Char('e') => {
-            app.notify("curve editor is not implemented yet (config: edit pmgfand.toml)")
-        }
-        KeyCode::Char('l') => app.notify("logs: see `journalctl -u pmgfand`"),
+        KeyCode::Esc => app.quit = true,
+        KeyCode::Char(c) => match c.to_ascii_lowercase() {
+            'q' => app.quit = true,
+            'a' => app.set_mode(Mode::IrmcAuto, "iRMC Auto"),
+            'c' => app.set_mode(Mode::Curve, "Curve"),
+            'f' => {
+                let seed = app
+                    .status
+                    .as_ref()
+                    .and_then(|s| match s.mode {
+                        Mode::FixedPwm(p) => Some(p),
+                        _ => s.pwm,
+                    })
+                    .unwrap_or(40);
+                app.pwm_dialog = Some(clamp_pwm(seed, 0, app.pwm_min, app.pwm_max));
+            }
+            'r' => app.notify("target RPM mode is not implemented yet (phase 7)"),
+            'e' => app.notify("curve editor is not implemented yet (config: edit pmgfand.toml)"),
+            'l' => app.notify("logs: see `journalctl -u pmgfand`"),
+            _ => {}
+        },
         _ => {}
     }
 }
 
 fn draw(f: &mut Frame, app: &App) {
-    let has_curves = !app.curves.is_empty();
+    let area = f.area();
+    if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
+        f.render_widget(
+            Paragraph::new(format!(
+                "terminal too small ({}x{}; need at least {}x{})",
+                area.width, area.height, MIN_WIDTH, MIN_HEIGHT
+            ))
+            .style(Style::default().fg(Color::Red)),
+            area,
+        );
+        return;
+    }
+
+    // 高さが足りなければカーブパネルを省略して footer を守る。
+    let show_curves = !app.curves.is_empty() && area.height >= CURVE_MIN_HEIGHT;
     let mut constraints = vec![
         Constraint::Length(3), // header
         Constraint::Length(9), // fans
         Constraint::Min(8),    // temperatures
     ];
-    if has_curves {
+    if show_curves {
         constraints.push(Constraint::Length(10)); // curve
     }
     constraints.push(Constraint::Length(2)); // footer
-    let chunks = Layout::vertical(constraints).split(f.area());
+    let chunks = Layout::vertical(constraints).split(area);
 
     draw_header(f, app, chunks[0]);
     draw_fans(f, app, chunks[1]);
     draw_temps(f, app, chunks[2]);
     let mut idx = 3;
-    if has_curves {
+    if show_curves {
         draw_curve(f, app, chunks[3]);
         idx = 4;
     }
     draw_footer(f, app, chunks[idx]);
 
     if let Some(pwm) = app.pwm_dialog {
-        draw_pwm_dialog(f, pwm);
+        draw_pwm_dialog(f, pwm, app.pwm_min, app.pwm_max);
     }
 }
 
@@ -288,6 +476,8 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     };
     let conn = if let Some(e) = &app.conn_error {
         Span::styled(format!("  conn: {e}"), Style::default().fg(Color::Red))
+    } else if app.status.is_none() {
+        Span::styled("  conn: …", Style::default().fg(Color::DarkGray))
     } else {
         Span::styled("  conn: OK", Style::default().fg(Color::Green))
     };
@@ -329,15 +519,16 @@ fn draw_fans(f: &mut Frame, app: &App, area: Rect) {
         .unwrap_or(1)
         .max(1) as usize;
 
-    let lines: Vec<Line> = status
+    let visible = inner.height as usize;
+    let mut lines: Vec<Line> = status
         .fans
         .iter()
-        .take(inner.height as usize)
+        .take(visible)
         .map(|fan| {
             let bar_w = inner.width.saturating_sub(34).max(4) as usize;
             let (rpm_s, bar) = match fan.rpm {
                 Some(rpm) => {
-                    let filled = rpm as usize * bar_w / max_rpm;
+                    let filled = (rpm as usize).saturating_mul(bar_w) / max_rpm;
                     let mut b = "█".repeat(filled.min(bar_w));
                     b.push_str(&"░".repeat(bar_w - filled.min(bar_w)));
                     (format!("{rpm:>6} RPM"), b)
@@ -360,6 +551,15 @@ fn draw_fans(f: &mut Frame, app: &App, area: Rect) {
             ])
         })
         .collect();
+    // 表示しきれない分はインジケータで知らせる（Alarm の見落とし防止）。
+    let hidden = status.fans.len().saturating_sub(visible);
+    if hidden > 0 && !lines.is_empty() {
+        lines.pop();
+        lines.push(Line::from(Span::styled(
+            format!(" … +{hidden} more"),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
     f.render_widget(Paragraph::new(lines), inner);
 }
 
@@ -383,6 +583,16 @@ fn draw_temps(f: &mut Frame, app: &App, area: Rect) {
     .split(inner);
     for (i, t) in status.temps.iter().enumerate() {
         if i >= rows.len() {
+            let hidden = status.temps.len() - rows.len();
+            if let Some(last) = rows.last() {
+                f.render_widget(
+                    Paragraph::new(Line::from(Span::styled(
+                        format!(" … +{hidden} more"),
+                        Style::default().fg(Color::DarkGray),
+                    ))),
+                    *last,
+                );
+            }
             break;
         }
         let key = format!("{}/{}", t.chip, t.label);
@@ -408,9 +618,14 @@ fn draw_temps(f: &mut Frame, app: &App, area: Rect) {
             ])),
             cells[0],
         );
+        let temp_s = if t.celsius.is_finite() {
+            format!("{:>5.1}°C", t.celsius)
+        } else {
+            "    --°C".to_string()
+        };
         f.render_widget(
             Paragraph::new(Span::styled(
-                format!("{:>5.1}°C", t.celsius),
+                temp_s,
                 Style::default().fg(color).add_modifier(Modifier::BOLD),
             )),
             cells[1],
@@ -427,9 +642,20 @@ fn draw_temps(f: &mut Frame, app: &App, area: Rect) {
 
 fn draw_curve(f: &mut Frame, app: &App, area: Rect) {
     let block = Block::default().title(" Fan Curves ").borders(Borders::ALL);
+    // 制御点の温度範囲に合わせて X 軸を広げる（設定値が
+    // 20..100 の外にはみ出しても見えるように）。
+    let (mut lo, mut hi) = (20.0_f64, 100.0_f64);
+    for c in &app.curves {
+        for p in &c.points {
+            lo = lo.min(p.temp as f64 - 5.0);
+            hi = hi.max(p.temp as f64 + 5.0);
+        }
+    }
+    let lo = lo.clamp(0.0, 90.0);
+    let hi = hi.clamp(lo + 5.0, 120.0);
     let canvas = Canvas::default()
         .block(block)
-        .x_bounds([20.0, 100.0])
+        .x_bounds([lo, hi])
         .y_bounds([0.0, 105.0])
         .paint(|ctx| {
             for (i, curve) in app.curves.iter().enumerate() {
@@ -449,7 +675,7 @@ fn draw_curve(f: &mut Frame, app: &App, area: Rect) {
                         color: Color::White,
                     });
                 }
-                ctx.print(21.0, 100.0 - i as f64 * 6.0, curve.sensor.to_string());
+                ctx.print(lo + 1.0, 100.0 - i as f64 * 6.0, curve.sensor.to_string());
             }
         });
     f.render_widget(canvas, area);
@@ -480,7 +706,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(vec![hint, notice]), area);
 }
 
-fn draw_pwm_dialog(f: &mut Frame, pwm: u8) {
+fn draw_pwm_dialog(f: &mut Frame, pwm: u8, pwm_min: u8, pwm_max: u8) {
     let area = centered_rect(30, 9, f.area());
     f.render_widget(Clear, area);
     let block = Block::default()
@@ -507,7 +733,7 @@ fn draw_pwm_dialog(f: &mut Frame, pwm: u8) {
         chunks[0],
     );
     f.render_widget(
-        Paragraph::new(format!("←/→ ±1%   Shift+←/→ ±5%   (min {DIALOG_MIN_PWM}%)"))
+        Paragraph::new(format!("←/→ ±1%   Shift+←/→ ±5%   ({pwm_min}..{pwm_max}%)"))
             .alignment(Alignment::Center)
             .style(Style::default().fg(Color::DarkGray)),
         chunks[2],
@@ -536,7 +762,9 @@ fn mode_label(mode: &Mode) -> String {
 }
 
 fn temp_color(c: f64) -> Color {
-    if c >= 85.0 {
+    if !c.is_finite() {
+        Color::DarkGray
+    } else if c >= 85.0 {
         Color::Red
     } else if c >= 70.0 {
         Color::Yellow
@@ -555,4 +783,138 @@ fn curve_color(i: usize) -> Color {
         Color::Red,
     ];
     COLORS[i % COLORS.len()]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_app() -> App {
+        let (tx, rx) = mpsc::unbounded_channel();
+        App::new(
+            PathBuf::from("/nonexistent.sock"),
+            Vec::new(),
+            DEFAULT_PWM_MIN,
+            DEFAULT_PWM_MAX,
+            tx,
+            rx,
+        )
+    }
+
+    #[test]
+    fn clamp_pwm_respects_bounds() {
+        assert_eq!(clamp_pwm(30, -1, 30, 100), 30);
+        assert_eq!(clamp_pwm(100, 1, 30, 100), 100);
+        assert_eq!(clamp_pwm(31, -5, 30, 100), 30);
+        assert_eq!(clamp_pwm(99, 5, 30, 100), 100);
+        assert_eq!(clamp_pwm(50, 1, 30, 100), 51);
+        // 設定由来の狭い範囲
+        assert_eq!(clamp_pwm(45, -10, 40, 80), 40);
+        assert_eq!(clamp_pwm(75, 10, 40, 80), 80);
+        // min > max の異常設定でも panic せず下限値に収まる
+        assert_eq!(clamp_pwm(50, 1, 90, 30), 30);
+    }
+
+    #[test]
+    fn clamp_pwm_seeds_out_of_range() {
+        assert_eq!(clamp_pwm(10, 0, 30, 100), 30);
+        assert_eq!(clamp_pwm(200, 0, 30, 100), 100);
+        assert_eq!(clamp_pwm(200, -1, 30, 100), 100);
+    }
+
+    #[test]
+    fn ctrl_c_quits_instead_of_mode_switch() {
+        let mut app = test_app();
+        handle_key(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(app.quit);
+        // Ctrl+<他のキー> は何も起きない（quit も set_mode も）
+        let mut app = test_app();
+        handle_key(&mut app, KeyCode::Char('a'), KeyModifiers::CONTROL);
+        handle_key(&mut app, KeyCode::Char('f'), KeyModifiers::CONTROL);
+        assert!(!app.quit);
+        assert!(app.pwm_dialog.is_none());
+    }
+
+    #[test]
+    fn alt_and_uppercase_keys() {
+        let mut app = test_app();
+        handle_key(&mut app, KeyCode::Char('q'), KeyModifiers::ALT);
+        assert!(!app.quit);
+        // 大文字・CapsLock でも quit できる
+        handle_key(&mut app, KeyCode::Char('Q'), KeyModifiers::SHIFT);
+        assert!(app.quit);
+    }
+
+    #[tokio::test]
+    async fn esc_quits_and_dialog_cancel() {
+        let mut app = test_app();
+        handle_key(&mut app, KeyCode::Char('f'), KeyModifiers::NONE);
+        assert!(app.pwm_dialog.is_some());
+        handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.pwm_dialog.is_none());
+        handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.quit);
+    }
+
+    #[tokio::test]
+    async fn dialog_uses_config_bounds() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut app = App::new(
+            PathBuf::from("/x.sock"),
+            Vec::new(),
+            40,
+            80,
+            tx,
+            rx,
+        );
+        // seed が範囲外でも開いた時点でクランプされる
+        app.status = Some(Status {
+            state: DaemonState::Controlling,
+            mode: Mode::FixedPwm(20),
+            pwm: Some(20),
+            fans: vec![],
+            temps: vec![],
+            uptime_secs: 0.0,
+        });
+        handle_key(&mut app, KeyCode::Char('f'), KeyModifiers::NONE);
+        assert_eq!(app.pwm_dialog, Some(40));
+        handle_key(&mut app, KeyCode::Right, KeyModifiers::SHIFT);
+        assert_eq!(app.pwm_dialog, Some(45));
+    }
+
+    #[test]
+    fn temp_color_ranges() {
+        assert_eq!(temp_color(50.0), Color::Green);
+        assert_eq!(temp_color(75.0), Color::Yellow);
+        assert_eq!(temp_color(90.0), Color::Red);
+        assert_eq!(temp_color(f64::NAN), Color::DarkGray);
+        assert_eq!(temp_color(f64::INFINITY), Color::DarkGray);
+    }
+
+    #[test]
+    fn centered_rect_stays_in_bounds() {
+        let area = Rect::new(0, 0, 10, 5);
+        let r = centered_rect(30, 9, area);
+        assert!(r.width <= area.width);
+        assert!(r.height <= area.height);
+        assert_eq!(r.x, 0);
+        assert_eq!(r.y, 0);
+        let big = Rect::new(5, 5, 80, 24);
+        let r = centered_rect(30, 9, big);
+        assert_eq!(r, Rect::new(30, 12, 30, 9));
+    }
+
+    #[test]
+    fn mode_label_variants() {
+        assert_eq!(mode_label(&Mode::IrmcAuto), "iRMC Auto");
+        assert_eq!(mode_label(&Mode::FixedPwm(42)), "Fixed PWM 42%");
+        assert_eq!(mode_label(&Mode::Curve), "Curve");
+        assert_eq!(
+            mode_label(&Mode::TargetRpm {
+                fan: "FAN CPU".into(),
+                rpm: 2500
+            }),
+            "Target 2500 RPM (FAN CPU)"
+        );
+    }
 }

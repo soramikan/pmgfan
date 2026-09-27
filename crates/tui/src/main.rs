@@ -58,17 +58,20 @@ enum Cmd {
     },
 }
 
-#[tokio::main(flavor = "current_thread")]
+// multi_thread が必須: TUI のイベントループは crossterm の
+// 同期 poll/draw で await しないため、current_thread だと
+// バックグラウンドの socket 要求タスクが永久に実行されない。
+#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<()> {
     // Rust はデフォルトで SIGPIPE を無視するため、パイプ切断時に
     // println! が panic する。CLI としては従来どおり SIG_DFL で
     // 静かに終了させる（head 等との組み合わせ対策）。
     unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
     let cli = Cli::parse();
-    // 引数なし: 端末付きなら TUI、パイプ等なら status
-    // （スクリプトからの出力を壊さない）
+    // 引数なし: 対話端末（stdin/stdout ともに TTY）なら TUI、
+    // パイプ等なら status（スクリプトからの出力を壊さない）
     let cmd = cli.cmd.unwrap_or_else(|| {
-        if std::io::stdout().is_terminal() {
+        if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
             Cmd::Tui
         } else {
             Cmd::Status
