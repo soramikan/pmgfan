@@ -31,11 +31,21 @@ const MAX_REQUEST_BYTES: u64 = 16 * 1024;
 /// （例: /tmp）を指されても、その属性を勝手に変えない）。
 pub fn bind(path: &Path) -> std::io::Result<UnixListener> {
     if let Some(dir) = path.parent() {
-        if !dir.as_os_str().is_empty() && !dir.exists() {
-            std::fs::create_dir_all(dir)?;
-            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o750))?;
-            // socket 同様に pmgfan グループで通過できるようにする
-            chown_to_group(dir);
+        if !dir.as_os_str().is_empty() {
+            // exists()+create_dir_all だと「先に存在した」のか
+            // 「自分が作った」のか区別できないため、create_dir の
+            // 結果で判定する（作成した dir にだけ権限を与える）。
+            match std::fs::create_dir(dir) {
+                Ok(()) => {
+                    set_dir_permissions(dir)?;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(_) => {
+                    // 親が無い等 → create_dir_all で作成した
+                    std::fs::create_dir_all(dir)?;
+                    set_dir_permissions(dir)?;
+                }
+            }
         }
     }
     let _ = std::fs::remove_file(path); // stale socket
@@ -69,6 +79,14 @@ where
             }
         });
     }
+}
+
+/// この関数が自ら作成したディレクトリにだけ適用する権限設定。
+fn set_dir_permissions(dir: &Path) -> std::io::Result<()> {
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o750))?;
+    // socket 同様に pmgfan グループで通過できるようにする
+    chown_to_group(dir);
+    Ok(())
 }
 
 /// socket のグループを `pmgfan` にする。グループが無ければ警告のみ。
