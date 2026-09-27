@@ -13,9 +13,12 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
+use pmgfan_core::config::Config;
+use pmgfan_core::control::ControlParams;
+use pmgfan_core::curve::Curve;
 use pmgfan_core::fan::FanReading;
 use pmgfan_core::hwmon;
-use pmgfan_core::protocol;
+use pmgfan_core::protocol::{self, Mode};
 use pmgfan_core::sensor::TempReading;
 use pmgfan_ipmi::backend::FanControlBackend;
 use pmgfan_ipmi::fujitsu;
@@ -37,7 +40,7 @@ struct Cli {
     /// ipmitool -I のインターフェース
     #[arg(short = 'I', long, global = true, default_value = "open")]
     interface: String,
-    /// 設定ファイル（Phase 4 で有効化予定）
+    /// 設定ファイル（省略時は既定値）
     #[arg(long, global = true)]
     config: Option<PathBuf>,
     /// 制御 socket のパス
@@ -92,10 +95,8 @@ async fn main() -> Result<()> {
 
     match cli.cmd.unwrap_or(Cmd::Run) {
         Cmd::Run => {
-            if cli.config.is_some() {
-                tracing::warn!("--config is accepted but not yet applied (Phase 4)");
-            }
-            daemon::run(backend, cli.socket).await
+            let params = build_params(cli.config.as_deref(), cli.socket.clone())?;
+            daemon::run(backend, params).await
         }
         Cmd::Probe => probe(&backend).await,
         Cmd::Fans => {
@@ -151,6 +152,59 @@ async fn main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// `--config`（あれば読み込み、なければ既定値）から
+/// `daemon::Params` を構築する。
+fn build_params(config_path: Option<&Path>, socket: PathBuf) -> Result<daemon::Params> {
+    let config: Config = match config_path {
+        Some(path) => {
+            let text = std::fs::read_to_string(path)
+                .with_context(|| format!("cannot read config {}", path.display()))?;
+            toml::from_str(&text)
+                .with_context(|| format!("cannot parse config {}", path.display()))?
+        }
+        None => Config::default(),
+    };
+
+    let curves: Vec<Curve> = config
+        .curves
+        .iter()
+        .map(|c| Curve::new(c.sensor.clone(), c.points.clone()))
+        .collect::<std::result::Result<_, _>>()
+        .context("invalid curve in config")?;
+
+    let cc = &config.control;
+    let startup_mode = match cc.mode.as_str() {
+        "auto" | "irmc_auto" => Mode::IrmcAuto,
+        "fixed_pwm" => Mode::FixedPwm(
+            cc.fixed_pwm
+                .context("[control] fixed_pwm is required when mode = \"fixed_pwm\"")?,
+        ),
+        "curve" => {
+            if curves.is_empty() {
+                bail!("mode = \"curve\" requires at least one [[curve]] section");
+            }
+            Mode::Curve
+        }
+        "target_rpm" => bail!("mode = \"target_rpm\" is not implemented yet (roadmap phase 7)"),
+        other => bail!("unknown [control] mode '{other}'"),
+    };
+
+    Ok(daemon::Params {
+        socket_path: socket,
+        poll_interval: std::time::Duration::from_millis(config.monitor.fan_interval_ms.max(200)),
+        apply_interval: cc.apply_interval(),
+        control: ControlParams {
+            min_pwm: cc.min_pwm,
+            max_pwm: cc.max_pwm,
+            step_up: cc.step_up,
+            step_down: cc.step_down,
+            down_hysteresis: cc.down_hysteresis,
+        },
+        curves,
+        startup_mode,
+    })
 }
 
 async fn probe(backend: &IpmitoolBackend) -> Result<()> {

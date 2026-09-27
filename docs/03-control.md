@@ -87,8 +87,6 @@ NVMe要求 = 55%
 
 ```toml
 [control]
-poll_interval_ms = 2000
-
 min_pwm = 30
 max_pwm = 100
 
@@ -96,7 +94,7 @@ step_up = 20
 step_down = 5
 
 down_hysteresis = 5
-min_change_interval_ms = 5000
+min_apply_interval_ms = 5000
 ```
 
 挙動イメージ:
@@ -111,7 +109,60 @@ min_change_interval_ms = 5000
        ↑ゆっくり
 ```
 
-## Target RPM（回転数指定制御）
+### 実装（Phase 3/4、`crates/core/src/control.rs`）
+
+- 書き込み周期は `min_apply_interval_ms` の tick で、1 tick の
+  変化量を `step_up`/`step_down` で制限する
+- **下降ヒステリシス**: 現在値と目標の差が `down_hysteresis`
+  未満の間は下降を開始しない。一度下降を開始したら
+  （差 ≥ hysteresis）、deadband を突き抜けて目標到達まで
+  `step_down` ずつ継続する
+- 目標値は事前に `min_pwm`..=`max_pwm` にクランプする
+
+## 制御ループの構造（Phase 3/4 実装）
+
+PWM への書き込みはデーモンの **制御ループのみ** が行う
+（`crates/daemon/src/daemon.rs` の `control_loop`）。
+
+```text
+apply tick (min_apply_interval_ms)
+   │
+   ├─ IrmcAuto   → 何もしない（解除済み）
+   ├─ FixedPwm   → cur != p なら即書込み。値が同じでも
+   │               REASSERT_TICKS(6) ごとに再送
+   │               （外部要因で override が消えた場合に備える）
+   └─ Curve      → curve_demand() = 解決可能な全カーブの
+                   要求値の最大 → RateLimiter → set_global_pwm
+                   全センサー解決不能 → clear_override +
+                   state=Degraded（iRMC Auto へ退避）
+```
+
+- **モード変更**: `mode_generation` カウンタをインクリメントし、
+  制御ループが変化を検知して RateLimiter をリセットする
+- **直列化**: 制御ループの PWM 操作と `apply_mode` の
+  `IrmcAuto` 即時解除は同一ミューテックス（`ctrl`）を取る。
+  「モード表示は Auto なのに override が残る」レースを防ぐ
+- `set_mode` の `fixed_pwm`/`curve` は共有状態の更新のみで、
+  実際の書き込みは次 tick で制御ループが行う。
+  `irmc_auto` は残留 override が危険なため即時解除する
+
+### センサー名の解決（`crates/core/src/sensor.rs`）
+
+カーブの `sensor` は論理名で、実センサーはエイリアスから解決する
+（大文字小文字・`_input` 接尾辞は正規化）:
+
+| 論理名 | 解決順 |
+|---|---|
+| `cpu_package` | `coretemp` / `Package id 0` → `ipmi` / `CPU` |
+| `cpu` | `ipmi` / `CPU` → `coretemp` / `Package id 0` |
+| `pch` | `ipmi` / `PCH` → `pch_cannonlake` / `temp1` |
+| `ambient` | `ipmi` / `Ambient` 系 |
+| `nvme` | `nvme` hwmon チップ |
+
+エイリアスに一致しない場合は `chip/label` 形式や
+ラベル名での直接指定も試す。
+
+## Target RPM（回転数指定制御・Phase 7 予定）
 
 実証済みの OEM コマンドは `set RPM` ではなく `set PWM`。
 そのため目標回転数は閉ループで実現する:

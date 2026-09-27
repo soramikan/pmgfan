@@ -1,5 +1,8 @@
 //! pmgfan 共通ドメイン型。OS / IPMI 実装に依存しない。
 
+pub mod config;
+pub mod control;
+pub mod curve;
 pub mod fan;
 pub mod hwmon;
 pub mod protocol;

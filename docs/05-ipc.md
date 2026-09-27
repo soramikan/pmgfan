@@ -68,11 +68,21 @@ Target RPM:
 {"type":"set_mode","mode":{"target_rpm":{"fan":"FAN CPU","rpm":2500}}}
 ```
 
+ファンカーブ（Phase 4 実装。`[[curve]]` 未設定時はエラー）:
+
+```json
+{"type":"set_mode","mode":"curve"}
+```
+
 iRMC Auto:
 
 ```json
 {"type":"set_mode","mode":"irmc_auto"}
 ```
+
+`target_rpm` は Phase 7 予定のため現在は
+`{"type":"error","error":"mode not implemented yet (roadmap phase 7)"}`
+を返す。
 
 ## 権限モデル
 

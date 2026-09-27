@@ -93,7 +93,8 @@ max_pwm = 100
 
 | キー | 説明 |
 |---|---|
-| `mode` | `auto` / `fixed_pwm` / `curve` / `target_rpm` |
+| `mode` | 起動時モード: `auto`(=`irmc_auto`) / `fixed_pwm` / `curve` / `target_rpm`（未実装・起動時拒否） |
+| `fixed_pwm` | `mode = "fixed_pwm"` のときの PWM 値（必須） |
 | `min_pwm` / `max_pwm` | PWM 許可範囲。min 未満は UI でも拒否 |
 | `step_up` / `step_down` | 1回の適用での PWM 変化上限 |
 | `down_hysteresis` | 降圧方向のヒステリシス |
@@ -112,8 +113,8 @@ max_pwm = 100
 
 | キー | 説明 |
 |---|---|
-| `sensor` | hwmon/IPMI センサー名 |
-| `points` | `[temp, pwm]` の配列。昇順・各値検証あり |
+| `sensor` | センサー名。論理エイリアス（`cpu_package`/`cpu`/`pch`/`ambient`/`nvme`）または `chip/label` 指定。解決規則は docs/03 参照 |
+| `points` | `[temp, pwm]` または `{temp=..., pwm=...}` の配列。温度昇順・各値検証あり（不正なら起動時エラー） |
 
 ### `[target_rpm]`
 

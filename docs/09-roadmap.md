@@ -1,16 +1,16 @@
 # 09. 実装ロードマップ
 
-| Phase | 実装 |
-|---|---|
-| 1 | RPM/温度監視 + OEM PWM set/clear |
-| 2 | daemon + Unix socket |
-| 3 | Fixed PWM / iRMC Auto |
-| 4 | ファンカーブ |
-| 5 | Safety state machine + systemd watchdog |
-| 6 | Ratatui TUI |
-| 7 | Target RPM PI controller |
-| 8 | 自動キャリブレーション |
-| 9 | native `/dev/ipmi0` backend |
+| Phase | 実装 | 状態 |
+|---|---|---|
+| 1 | RPM/温度監視 + OEM PWM set/clear | ✅ 実機検証済み |
+| 2 | daemon + Unix socket | ✅ 実機検証済み |
+| 3 | Fixed PWM / iRMC Auto | ✅ 実機検証済み |
+| 4 | ファンカーブ | ✅ 実機検証済み |
+| 5 | Safety state machine + systemd watchdog | 一部済み（watchdog/Degraded/フェイルセーフ動作） |
+| 6 | Ratatui TUI | 未着手 |
+| 7 | Target RPM PI controller | 未着手 |
+| 8 | 自動キャリブレーション | 未着手 |
+| 9 | native `/dev/ipmi0` backend | 未着手 |
 
 **Phase 1〜5 を完成させてから Target RPM を入れる。**
 安全機構なしに閉ループ制御を先に作ると、センサー喪失時に

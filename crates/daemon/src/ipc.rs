@@ -7,11 +7,12 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::Arc;
 
+use pmgfan_core::curve::Curve;
 use pmgfan_core::protocol::{decode_request, encode, Request, Response};
 use pmgfan_ipmi::backend::FanControlBackend;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tracing::warn;
 
 use crate::daemon::{apply_mode, Shared};
@@ -19,7 +20,13 @@ use crate::daemon::{apply_mode, Shared};
 const SOCKET_GROUP: &str = "pmgfan";
 
 /// socket を bind し、接続ごとにタスクを立てて処理する。
-pub async fn serve<B>(path: &Path, backend: Arc<B>, shared: Arc<RwLock<Shared>>) -> std::io::Result<()>
+pub async fn serve<B>(
+    path: &Path,
+    backend: Arc<B>,
+    shared: Arc<RwLock<Shared>>,
+    curves: Arc<Vec<Curve>>,
+    ctrl: Arc<Mutex<()>>,
+) -> std::io::Result<()>
 where
     B: FanControlBackend + Send + Sync + 'static,
 {
@@ -38,8 +45,10 @@ where
         let (conn, _) = listener.accept().await?;
         let backend = Arc::clone(&backend);
         let shared = Arc::clone(&shared);
+        let curves = Arc::clone(&curves);
+        let ctrl = Arc::clone(&ctrl);
         tokio::spawn(async move {
-            if let Err(e) = handle(conn, &*backend, &shared).await {
+            if let Err(e) = handle(conn, &*backend, &shared, &curves, &ctrl).await {
                 warn!(error = %e, "ipc connection failed");
             }
         });
@@ -67,11 +76,13 @@ async fn handle<B: FanControlBackend>(
     conn: UnixStream,
     backend: &B,
     shared: &RwLock<Shared>,
+    curves: &[Curve],
+    ctrl: &Mutex<()>,
 ) -> std::io::Result<()> {
     let (r, mut w) = conn.into_split();
     let mut lines = BufReader::new(r).lines();
     while let Some(line) = lines.next_line().await? {
-        let resp = dispatch(&line, backend, shared).await;
+        let resp = dispatch(&line, backend, shared, curves, ctrl).await;
         let mut out = encode(&resp).unwrap_or_else(|_| {
             r#"{"version":1,"type":"error","error":"encode failed"}"#.to_string()
         });
@@ -85,6 +96,8 @@ async fn dispatch<B: FanControlBackend>(
     line: &str,
     backend: &B,
     shared: &RwLock<Shared>,
+    curves: &[Curve],
+    ctrl: &Mutex<()>,
 ) -> Response {
     let req = match decode_request(line) {
         Ok(r) => r,
@@ -104,7 +117,8 @@ async fn dispatch<B: FanControlBackend>(
                 uptime_secs: s.started.elapsed().as_secs_f64(),
             }
         }
-        Request::SetMode { mode } => match apply_mode(backend, shared, &mode).await {
+        Request::SetMode { mode } => match apply_mode(backend, shared, ctrl, curves, &mode).await
+        {
             Ok(()) => Response::Ok,
             Err(e) => Response::Error { error: e },
         },

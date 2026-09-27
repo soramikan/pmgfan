@@ -1,4 +1,5 @@
-//! pmgfand デーモン本体（Phase 2: 監視 + Unix socket + 基本的なモード適用）。
+//! pmgfand デーモン本体。
+//! Phase 2: 監視 + Unix socket。Phase 3/4: 制御ループ（Fixed PWM / iRMC Auto / Curve）。
 
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -6,28 +7,45 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
+use pmgfan_core::control::{ControlParams, RateLimiter};
+use pmgfan_core::curve::Curve;
 use pmgfan_core::fan::FanReading;
 use pmgfan_core::hwmon;
 use pmgfan_core::protocol::{DaemonState, Mode};
-use pmgfan_core::sensor::TempReading;
+use pmgfan_core::sensor::{self, TempReading};
 use pmgfan_ipmi::backend::FanControlBackend;
 use pmgfan_ipmi::fujitsu;
 use tokio::net::UnixDatagram;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tokio::time::interval;
 use tracing::{error, info, warn};
 
 use crate::ipc;
 
-/// ポーリング周期（Phase 2 では固定。config 対応は Phase 4）。
-const POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// PWM 値が変わらなくても強制値を再送する間隔（適用 tick 数）。
+const REASSERT_TICKS: u32 = 6;
+
+/// デーモン動作パラメータ（config または既定値から構築）。
+#[derive(Debug, Clone)]
+pub struct Params {
+    pub socket_path: PathBuf,
+    pub poll_interval: Duration,
+    pub apply_interval: Duration,
+    pub control: ControlParams,
+    pub curves: Vec<Curve>,
+    pub startup_mode: Mode,
+}
 
 /// デーモンの共有状態。
 #[derive(Debug)]
 pub struct Shared {
     pub state: DaemonState,
+    /// 現在の要求モード（IPC set_mode で変更される）
     pub mode: Mode,
-    /// 現在強制している PWM。モードが強制系でない場合 None。
+    /// mode 変更ごとにインクリメント。制御ループが
+    /// 変化を検知してリミッタをリセットする
+    pub mode_generation: u64,
+    /// 現在書き込んでいる PWM。強制系でなければ None
     pub pwm: Option<u8>,
     pub fans: Vec<FanReading>,
     pub temps: Vec<TempReading>,
@@ -38,10 +56,11 @@ pub struct Shared {
 }
 
 impl Shared {
-    fn new() -> Self {
+    fn new(startup_mode: Mode) -> Self {
         Self {
             state: DaemonState::Starting,
-            mode: Mode::IrmcAuto,
+            mode: startup_mode,
+            mode_generation: 0,
             pwm: None,
             fans: Vec::new(),
             temps: Vec::new(),
@@ -56,12 +75,13 @@ impl Shared {
 ///
 /// 終了時（SIGTERM/SIGINT 含む）は必ず OEM override を解除して
 /// iRMC 自動制御へ戻す（フェイルセーフ。docs/04-safety.md）。
-pub async fn run<B>(backend: B, socket_path: PathBuf) -> Result<()>
+pub async fn run<B>(backend: B, params: Params) -> Result<()>
 where
     B: FanControlBackend + Send + Sync + 'static,
 {
     let backend = Arc::new(backend);
-    let shared = Arc::new(RwLock::new(Shared::new()));
+    let shared = Arc::new(RwLock::new(Shared::new(params.startup_mode.clone())));
+    let socket_path = params.socket_path.clone();
 
     // 単一インスタンスロック。2重起動は IPMI 操作・socket 掃除で
     // 互いに干渉するため、起動直後に fail-fast で防ぐ。
@@ -75,33 +95,65 @@ where
     let poll = {
         let backend = Arc::clone(&backend);
         let shared = Arc::clone(&shared);
-        tokio::spawn(async move { poll_loop(&*backend, &shared).await })
+        let poll_interval = params.poll_interval;
+        tokio::spawn(async move { poll_loop(&*backend, &shared, poll_interval).await })
+    };
+
+    // PWM/override 操作の直列化ロック。制御ループの書き込みと
+    // apply_mode の即時解除が入れ違いで「iRMC Auto 表示のまま
+    // override が残る」ことを防ぐ。
+    let ctrl = Arc::new(Mutex::new(()));
+
+    // 制御ループ（PWM 書き込みの単一主体）
+    let control = {
+        let backend = Arc::clone(&backend);
+        let shared = Arc::clone(&shared);
+        let ctrl = Arc::clone(&ctrl);
+        let apply_interval = params.apply_interval;
+        let control_params = params.control;
+        let curves = params.curves.clone();
+        tokio::spawn(async move {
+            control_loop(&*backend, &shared, &ctrl, control_params, &curves, apply_interval)
+                .await
+        })
     };
 
     // Unix socket
-    let ipc = {
+    let ipc_task = {
         let backend = Arc::clone(&backend);
         let shared = Arc::clone(&shared);
+        let curves = Arc::new(params.curves.clone());
         let path = socket_path.clone();
-        tokio::spawn(async move { ipc::serve(&path, backend, shared).await })
+        tokio::spawn(async move { ipc::serve(&path, backend, shared, curves, ctrl).await })
     };
 
     // systemd watchdog（WATCHDOG_USEC があれば半周期でキック）
     spawn_watchdog();
 
+    // 起動モードを反映
     {
         let mut s = shared.write().await;
-        s.state = DaemonState::Monitoring;
+        s.state = match s.mode {
+            Mode::IrmcAuto => DaemonState::Monitoring,
+            _ => DaemonState::Controlling,
+        };
+        if s.mode == Mode::IrmcAuto {
+            // 前回の強制が残っている可能性を潰す
+            if let Err(e) = backend.clear_override().await {
+                warn!(error = %e, "startup clear_override failed");
+            }
+        }
     }
     sd_notify("READY=1").await;
-    info!(socket = %socket_path.display(), "pmgfand started");
+    info!(socket = %socket_path.display(), mode = ?params.startup_mode, "pmgfand started");
 
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     tokio::select! {
         _ = tokio::signal::ctrl_c() => info!("SIGINT received"),
         _ = sigterm.recv() => info!("SIGTERM received"),
         r = poll => error!(?r, "poller exited"),
-        r = ipc => error!(?r, "ipc server exited"),
+        r = control => error!(?r, "control loop exited"),
+        r = ipc_task => error!(?r, "ipc server exited"),
     }
 
     // シャットダウン: 必ず iRMC 自動制御へ戻す
@@ -114,8 +166,12 @@ where
     Ok(())
 }
 
-async fn poll_loop<B: FanControlBackend>(backend: &B, shared: &RwLock<Shared>) {
-    let mut tick = interval(POLL_INTERVAL);
+async fn poll_loop<B: FanControlBackend>(
+    backend: &B,
+    shared: &RwLock<Shared>,
+    poll_interval: Duration,
+) {
+    let mut tick = interval(poll_interval);
     loop {
         tick.tick().await;
         let mut s = shared.write().await;
@@ -148,6 +204,128 @@ async fn poll_loop<B: FanControlBackend>(backend: &B, shared: &RwLock<Shared>) {
     }
 }
 
+/// 制御ループ。PWM への書き込みはここだけが行う
+/// （`apply_mode` の IrmcAuto 即時解除を除く）。
+async fn control_loop<B: FanControlBackend>(
+    backend: &B,
+    shared: &RwLock<Shared>,
+    ctrl: &Mutex<()>,
+    params: ControlParams,
+    curves: &[Curve],
+    apply_interval: Duration,
+) {
+    let mut limiter = RateLimiter::new(params);
+    let mut seen_gen = 0u64;
+    let mut ticks_since_write = 0u32;
+    let mut tick = interval(apply_interval);
+
+    loop {
+        tick.tick().await;
+        // PWM 操作は apply_mode の即時解除と直列化する
+        let _ctrl = ctrl.lock().await;
+        let (mode, gen, temps) = {
+            let s = shared.read().await;
+            (s.mode.clone(), s.mode_generation, s.temps.clone())
+        };
+        if gen != seen_gen {
+            limiter.reset();
+            ticks_since_write = 0;
+            seen_gen = gen;
+        }
+
+        match mode {
+            Mode::IrmcAuto => {}
+            Mode::FixedPwm(p) => {
+                // 外部要因で解除される可能性に備え周期再アサート。
+                // ただし値が変わった tick で即時書き込み、変わらなければ
+                // REASSERT_TICKS ごとに再送する。
+                let cur = { shared.read().await.pwm };
+                ticks_since_write += 1;
+                if cur != Some(p) || ticks_since_write >= REASSERT_TICKS {
+                    write_pwm(backend, shared, p).await;
+                    ticks_since_write = 0;
+                }
+            }
+            Mode::Curve => {
+                let target = curve_demand(curves, &temps);
+                match target {
+                    None => {
+                        // 参照センサーが全滅 → 独自制御は捨てて iRMC へ戻す
+                        let needs_clear = shared.read().await.pwm.is_some();
+                        if needs_clear {
+                            warn!("no curve sensors readable; clearing override (iRMC auto)");
+                            if let Err(e) = backend.clear_override().await {
+                                error!(error = %e, "clear_override failed");
+                            }
+                        }
+                        let mut s = shared.write().await;
+                        if needs_clear {
+                            s.pwm = None;
+                        }
+                        s.state = DaemonState::Degraded;
+                    }
+                    Some(target) => match limiter.next(target) {
+                        Some(p) => {
+                            write_pwm(backend, shared, p).await;
+                            ticks_since_write = 0;
+                        }
+                        None => {
+                            ticks_since_write += 1;
+                            if ticks_since_write >= REASSERT_TICKS {
+                                if let Some(p) = limiter.current() {
+                                    write_pwm(backend, shared, p).await;
+                                }
+                                ticks_since_write = 0;
+                            }
+                        }
+                    },
+                }
+            }
+            Mode::TargetRpm { .. } => {
+                // Phase 7 で実装。set_mode では拒否済みだが
+                // config 直書き等で来た場合の保険。
+                warn!("target_rpm mode is not implemented yet");
+            }
+        }
+    }
+}
+
+/// 全カーブを現在温度で評価し、最大要求 PWM を返す。
+/// 1つも解決できなければ `None`。
+fn curve_demand(curves: &[Curve], temps: &[TempReading]) -> Option<u8> {
+    curves
+        .iter()
+        .filter_map(|c| {
+            let t = sensor::resolve(temps, &c.sensor);
+            if t.is_none() {
+                warn!(sensor = %c.sensor, "curve sensor not readable");
+            }
+            t.map(|t| c.eval(t.celsius as f32).round().clamp(0.0, 100.0) as u8)
+        })
+        .max()
+}
+
+async fn write_pwm<B: FanControlBackend>(backend: &B, shared: &RwLock<Shared>, pwm: u8) {
+    match backend.set_global_pwm(pwm).await {
+        Ok(()) => {
+            let mut s = shared.write().await;
+            s.pwm = Some(pwm);
+            s.state = DaemonState::Controlling;
+            s.ipmi_failures = 0;
+            s.last_error = None;
+        }
+        Err(e) => {
+            let mut s = shared.write().await;
+            s.ipmi_failures += 1;
+            s.last_error = Some(e.to_string());
+            if s.ipmi_failures >= 3 {
+                s.state = DaemonState::Degraded;
+            }
+            warn!(error = %e, "pwm write failed");
+        }
+    }
+}
+
 fn read_hwmon() -> Vec<TempReading> {
     hwmon::read_temperatures(Path::new(hwmon::HWMON_ROOT)).unwrap_or_default()
 }
@@ -172,20 +350,26 @@ fn acquire_instance_lock(run_dir: &Path) -> Result<std::fs::File> {
     Ok(file)
 }
 
-/// モード変更を適用する。IPC ハンドラから呼ばれる。
+/// モード変更の検証と共有状態への反映。
 ///
-/// Phase 2 では `IrmcAuto` / `FixedPwm` のみ実装。
-/// `Curve` / `TargetRpm` は後続フェーズ。
+/// `FixedPwm`/`Curve` は制御ループが次 tick で適用する。
+/// `IrmcAuto` は強制残存が危険なためここで即座に解除する。
 pub async fn apply_mode<B: FanControlBackend>(
     backend: &B,
     shared: &RwLock<Shared>,
+    ctrl: &Mutex<()>,
+    curves: &[Curve],
     mode: &Mode,
 ) -> std::result::Result<(), String> {
     match mode {
         Mode::IrmcAuto => {
+            // 制御ループの書き込みと直列化。ここが先なら次 tick で
+            // Auto を見て書き込みを止め、後ならこの解除が最終状態になる。
+            let _ctrl = ctrl.lock().await;
             backend.clear_override().await.map_err(|e| e.to_string())?;
             let mut s = shared.write().await;
             s.mode = Mode::IrmcAuto;
+            s.mode_generation += 1;
             s.pwm = None;
             s.state = DaemonState::Monitoring;
             info!("mode -> irmc_auto");
@@ -201,16 +385,24 @@ pub async fn apply_mode<B: FanControlBackend>(
                     fujitsu::MIN_SAFE_PWM
                 ));
             }
-            backend.set_global_pwm(*p).await.map_err(|e| e.to_string())?;
             let mut s = shared.write().await;
             s.mode = mode.clone();
-            s.pwm = Some(*p);
-            s.state = DaemonState::Controlling;
+            s.mode_generation += 1;
             info!(pwm = p, "mode -> fixed_pwm");
             Ok(())
         }
-        Mode::Curve | Mode::TargetRpm { .. } => {
-            Err("mode not implemented yet (roadmap phase 4/7)".into())
+        Mode::Curve => {
+            if curves.is_empty() {
+                return Err("no fan curves configured".into());
+            }
+            let mut s = shared.write().await;
+            s.mode = Mode::Curve;
+            s.mode_generation += 1;
+            info!("mode -> curve");
+            Ok(())
+        }
+        Mode::TargetRpm { .. } => {
+            Err("mode not implemented yet (roadmap phase 7)".into())
         }
     }
 }

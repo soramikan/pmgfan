@@ -29,6 +29,22 @@ FAN1 SYS = 0 RPM
 daemon shutdown
 ```
 
+### 実装済み（Phase 4 時点）
+
+- **curve センサー全滅**: カーブ参照センサーが1つも解決
+  できない tick で `clear_override` を実行し iRMC Auto へ退避
+  （`state = Degraded`）
+- **IPMI 連続失敗**: ファン読み取り・PWM 書き込みの連続失敗が
+  `ipmi_failure_limit`（既定3）に達すると `state = Degraded`
+- **モード変更の直列化**: `apply_mode` の iRMC Auto 即時解除と
+  制御ループの PWM 書き込みは同一ミューテックスで直列化し、
+  「Auto 表示なのに override が残る」レースを防ぐ
+- **daemon shutdown**: SIGTERM/SIGINT で必ず `clear_override`
+  を実行してから終了（実機検証済み）
+- **不正設定**: `mode = "curve"` で `[[curve]]` 未定義、
+  `mode = "fixed_pwm"` で `fixed_pwm` 未指定、昇順でない
+  カーブ点などは起動時にエラー終了
+
 ## FAILSAFE の動作
 
 基本動作は **OEM PWM override の解除**（iRMC 標準制御へ戻す）。
