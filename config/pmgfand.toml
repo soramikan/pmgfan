@@ -10,7 +10,7 @@ interface = "open"
 [monitor]
 fan_interval_ms = 2000
 temperature_interval_ms = 1000
-history_seconds = 900
+history_seconds = 900  # TUI スパークライン用（Phase 6・現在未使用）
 
 [control]
 mode = "curve"
@@ -24,13 +24,14 @@ down_hysteresis = 5
 min_apply_interval_ms = 5000
 
 [safety]
-sensor_stale_seconds = 10
+sensor_stale_seconds = 10  # センサー陳腐化 FAILSAFE（Phase 5・現在未使用）
 ipmi_failure_limit = 3
 
+# 緊急温度。超過時はモードに関わらず 100% PWM を強制し Failsafe 状態へ
 cpu_emergency = 90
 pch_emergency = 95
 
-fail_action = "irmc-auto"
+fail_action = "irmc-auto"  # 現在は irmc-auto 固定（他アクション未実装）
 
 [[curve]]
 sensor = "cpu_package"

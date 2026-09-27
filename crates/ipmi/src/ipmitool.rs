@@ -13,6 +13,10 @@ use tokio::process::Command;
 use crate::backend::{FanControlBackend, IpmiError, PwmSlot, Result};
 use crate::fujitsu;
 
+/// 1回の ipmitool 呼び出しの上限。これを超えると子プロセスを kill して
+/// エラーにする（デーモン側で無制限に待機しないための保証）。
+const COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 pub struct IpmitoolBackend {
     bin: OsString,
     interface: String,
@@ -42,16 +46,24 @@ impl IpmitoolBackend {
             cmdline.push(' ');
             cmdline.push_str(a);
         }
-        let out = Command::new(&self.bin)
-            .arg("-I")
+        let mut cmd = Command::new(&self.bin);
+        cmd.arg("-I")
             .arg(&self.interface)
             .args(args)
-            .output()
-            .await
-            .map_err(|e| IpmiError::Spawn {
+            // タイムアウト時に future が drop されても子プロセスが残らないように
+            .kill_on_drop(true);
+        let out = match tokio::time::timeout(COMMAND_TIMEOUT, cmd.output()).await {
+            Ok(out) => out.map_err(|e| IpmiError::Spawn {
                 cmd: cmdline.clone(),
                 source: e,
-            })?;
+            })?,
+            Err(_) => {
+                return Err(IpmiError::Command {
+                    cmd: cmdline,
+                    stderr: format!("timed out after {}s", COMMAND_TIMEOUT.as_secs()),
+                });
+            }
+        };
         if !out.status.success() {
             return Err(IpmiError::Command {
                 cmd: cmdline,
@@ -85,6 +97,19 @@ impl IpmitoolBackend {
 }
 
 impl FanControlBackend for IpmitoolBackend {
+    fn model_name(&self) -> impl std::future::Future<Output = Result<String>> + Send {
+        async move {
+            let fru = self.fru().await?;
+            fru.lines()
+                .find_map(|l| {
+                    l.split_once(':')
+                        .filter(|(k, _)| k.trim() == "Product Name")
+                        .map(|(_, v)| v.trim().to_string())
+                })
+                .ok_or_else(|| IpmiError::Parse("Product Name not found in fru".into()))
+        }
+    }
+
     fn fans(&self) -> impl std::future::Future<Output = Result<Vec<FanReading>>> + Send {
         async move {
             let out = self

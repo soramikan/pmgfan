@@ -37,9 +37,9 @@ struct Cli {
     /// ipmitool バイナリ
     #[arg(long, global = true, default_value = "ipmitool")]
     ipmitool: OsString,
-    /// ipmitool -I のインターフェース
-    #[arg(short = 'I', long, global = true, default_value = "open")]
-    interface: String,
+    /// ipmitool -I のインターフェース（未指定時は config [device] interface → "open"）
+    #[arg(short = 'I', long, global = true)]
+    interface: Option<String>,
     /// 設定ファイル（省略時は既定値）
     #[arg(long, global = true)]
     config: Option<PathBuf>,
@@ -91,72 +91,87 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    let backend = IpmitoolBackend::new(&cli.ipmitool, &cli.interface);
+    let bin = cli.ipmitool.clone();
+    let cli_iface = cli.interface.clone();
 
     match cli.cmd.unwrap_or(Cmd::Run) {
         Cmd::Run => {
-            let params = build_params(cli.config.as_deref(), cli.socket.clone())?;
+            let (params, cfg_iface) = build_params(cli.config.as_deref(), cli.socket.clone())?;
+            let iface = cli_iface.unwrap_or(cfg_iface);
+            let backend = IpmitoolBackend::new(bin, iface);
             daemon::run(backend, params).await
         }
-        Cmd::Probe => probe(&backend).await,
-        Cmd::Fans => {
-            print_fans(&backend.fans().await?);
-            Ok(())
-        }
-        Cmd::Temps => {
-            let mut temps = backend.temperatures().await?;
-            temps.extend(hwmon::read_temperatures(Path::new(hwmon::HWMON_ROOT))?);
-            print_temps(&temps);
-            Ok(())
-        }
-        Cmd::Monitor { interval } => monitor(&backend, interval).await,
-        Cmd::SetPwm {
-            percent,
-            allow_low,
-        } => {
-            if percent > fujitsu::MAX_PWM {
-                bail!("percent must be 0..=100, got {percent}");
+        cmd => {
+            let backend =
+                IpmitoolBackend::new(bin, cli_iface.unwrap_or_else(|| "open".into()));
+            match cmd {
+                Cmd::Probe => probe(&backend).await,
+                Cmd::Fans => {
+                    print_fans(&backend.fans().await?);
+                    Ok(())
+                }
+                Cmd::Temps => {
+                    let mut temps = backend.temperatures().await?;
+                    temps
+                        .extend(hwmon::read_temperatures(Path::new(hwmon::HWMON_ROOT))
+                            .unwrap_or_default());
+                    print_temps(&temps);
+                    Ok(())
+                }
+                Cmd::Monitor { interval } => monitor(&backend, interval).await,
+                Cmd::SetPwm {
+                    percent,
+                    allow_low,
+                } => {
+                    if percent > fujitsu::MAX_PWM {
+                        bail!("percent must be 0..=100, got {percent}");
+                    }
+                    if percent < fujitsu::MIN_SAFE_PWM && !allow_low {
+                        bail!(
+                            "refusing to set below {}%; pass --allow-low if you really want that",
+                            fujitsu::MIN_SAFE_PWM
+                        );
+                    }
+                    backend.set_global_pwm(percent).await?;
+                    println!("set all PWM channels to {percent}%");
+                    print_fans(&backend.fans().await?);
+                    Ok(())
+                }
+                Cmd::Read { indices } => {
+                    let indices = parse_indices(&indices)?;
+                    let slots = backend.read_override_slots(&indices).await?;
+                    if slots.is_empty() {
+                        println!("(empty response)");
+                    }
+                    for s in slots {
+                        println!(
+                            "slot 0x{:02x} = 0x{:02x} ({}){}",
+                            s.index,
+                            s.value,
+                            s.value,
+                            if s.forced { " FORCED" } else { "" }
+                        );
+                    }
+                    Ok(())
+                }
+                Cmd::ClearOverride => {
+                    backend.clear_override().await?;
+                    println!("cleared PWM override; iRMC automatic control restored");
+                    print_fans(&backend.fans().await?);
+                    Ok(())
+                }
+                Cmd::Run => unreachable!("handled above"),
             }
-            if percent < fujitsu::MIN_SAFE_PWM && !allow_low {
-                bail!(
-                    "refusing to set below {}%; pass --allow-low if you really want that",
-                    fujitsu::MIN_SAFE_PWM
-                );
-            }
-            backend.set_global_pwm(percent).await?;
-            println!("set all PWM channels to {percent}%");
-            print_fans(&backend.fans().await?);
-            Ok(())
-        }
-        Cmd::Read { indices } => {
-            let indices = parse_indices(&indices)?;
-            let slots = backend.read_override_slots(&indices).await?;
-            if slots.is_empty() {
-                println!("(empty response)");
-            }
-            for s in slots {
-                println!(
-                    "slot 0x{:02x} = 0x{:02x} ({}){}",
-                    s.index,
-                    s.value,
-                    s.value,
-                    if s.forced { " FORCED" } else { "" }
-                );
-            }
-            Ok(())
-        }
-        Cmd::ClearOverride => {
-            backend.clear_override().await?;
-            println!("cleared PWM override; iRMC automatic control restored");
-            print_fans(&backend.fans().await?);
-            Ok(())
         }
     }
 }
 
 /// `--config`（あれば読み込み、なければ既定値）から
-/// `daemon::Params` を構築する。
-fn build_params(config_path: Option<&Path>, socket: PathBuf) -> Result<daemon::Params> {
+/// `daemon::Params` と ipmitool インターフェース名を構築する。
+///
+/// 設定値はここで検証する。IPC 側の検査（apply_mode）を
+/// 迂回しないよう、不整合な設定は起動時エラーにする。
+fn build_params(config_path: Option<&Path>, socket: PathBuf) -> Result<(daemon::Params, String)> {
     let config: Config = match config_path {
         Some(path) => {
             let text = std::fs::read_to_string(path)
@@ -175,12 +190,45 @@ fn build_params(config_path: Option<&Path>, socket: PathBuf) -> Result<daemon::P
         .context("invalid curve in config")?;
 
     let cc = &config.control;
+    // PWM 範囲・ステップの不変条件。config 経由でも安全下限を割らせない
+    if cc.min_pwm < fujitsu::MIN_SAFE_PWM {
+        bail!(
+            "[control] min_pwm {} is below the safety floor {}%",
+            cc.min_pwm,
+            fujitsu::MIN_SAFE_PWM
+        );
+    }
+    if cc.min_pwm > cc.max_pwm || cc.max_pwm > fujitsu::MAX_PWM {
+        bail!(
+            "[control] invalid pwm range min={} max={} (need {}..={})",
+            cc.min_pwm,
+            cc.max_pwm,
+            fujitsu::MIN_SAFE_PWM,
+            fujitsu::MAX_PWM
+        );
+    }
+    if cc.step_up == 0 || cc.step_down == 0 {
+        bail!("[control] step_up/step_down must be >= 1");
+    }
+    if config.safety.ipmi_failure_limit == 0 {
+        bail!("[safety] ipmi_failure_limit must be >= 1");
+    }
+
     let startup_mode = match cc.mode.as_str() {
         "auto" | "irmc_auto" => Mode::IrmcAuto,
-        "fixed_pwm" => Mode::FixedPwm(
-            cc.fixed_pwm
-                .context("[control] fixed_pwm is required when mode = \"fixed_pwm\"")?,
-        ),
+        "fixed_pwm" => {
+            let p = cc
+                .fixed_pwm
+                .context("[control] fixed_pwm is required when mode = \"fixed_pwm\"")?;
+            if !(cc.min_pwm..=cc.max_pwm).contains(&p) {
+                bail!(
+                    "[control] fixed_pwm {p} is outside configured range {}..={}",
+                    cc.min_pwm,
+                    cc.max_pwm
+                );
+            }
+            Mode::FixedPwm(p)
+        }
         "curve" => {
             if curves.is_empty() {
                 bail!("mode = \"curve\" requires at least one [[curve]] section");
@@ -191,9 +239,10 @@ fn build_params(config_path: Option<&Path>, socket: PathBuf) -> Result<daemon::P
         other => bail!("unknown [control] mode '{other}'"),
     };
 
-    Ok(daemon::Params {
+    let params = daemon::Params {
         socket_path: socket,
-        poll_interval: std::time::Duration::from_millis(config.monitor.fan_interval_ms.max(200)),
+        fan_interval: Duration::from_millis(config.monitor.fan_interval_ms.max(200)),
+        temp_interval: Duration::from_millis(config.monitor.temperature_interval_ms.max(200)),
         apply_interval: cc.apply_interval(),
         control: ControlParams {
             min_pwm: cc.min_pwm,
@@ -204,7 +253,12 @@ fn build_params(config_path: Option<&Path>, socket: PathBuf) -> Result<daemon::P
         },
         curves,
         startup_mode,
-    })
+        ipmi_failure_limit: config.safety.ipmi_failure_limit.max(1),
+        cpu_emergency: config.safety.cpu_emergency,
+        pch_emergency: config.safety.pch_emergency,
+        expected_model: config.device.model.clone(),
+    };
+    Ok((params, config.device.interface))
 }
 
 async fn probe(backend: &IpmitoolBackend) -> Result<()> {
@@ -246,7 +300,7 @@ async fn monitor(backend: &IpmitoolBackend, interval: f64) -> Result<()> {
                 Vec::new()
             }
         };
-        temps.extend(hwmon::read_temperatures(Path::new(hwmon::HWMON_ROOT))?);
+        temps.extend(hwmon::read_temperatures(Path::new(hwmon::HWMON_ROOT)).unwrap_or_default());
         print_temps(&temps);
         sleep(Duration::from_secs_f64(interval.max(0.2))).await;
     }
@@ -271,14 +325,21 @@ fn parse_indices(args: &[String]) -> Result<Vec<u8>> {
     if args.is_empty() {
         return Ok(fujitsu::DEFAULT_SLOT_INDICES.to_vec());
     }
+    if args.len() > 31 {
+        bail!("too many slot indices (max 31)");
+    }
     args.iter()
         .map(|s| {
             let s = s.trim();
-            if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-                u8::from_str_radix(hex, 16).map_err(|e| anyhow::anyhow!("bad index '{s}': {e}"))
+            let idx = if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+                u8::from_str_radix(hex, 16).map_err(|e| anyhow::anyhow!("bad index '{s}': {e}"))?
             } else {
-                s.parse::<u8>().map_err(|e| anyhow::anyhow!("bad index '{s}': {e}"))
+                s.parse::<u8>().map_err(|e| anyhow::anyhow!("bad index '{s}': {e}"))?
+            };
+            if idx > 31 {
+                bail!("slot index out of range 0..31: {idx}");
             }
+            Ok(idx)
         })
         .collect()
 }

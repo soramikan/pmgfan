@@ -77,9 +77,9 @@ max_pwm = 100
 
 | キー | 説明 |
 |---|---|
-| `model` | 期待する機種名。起動時検証に使う |
+| `model` | 期待する機種名。起動時に FRU Product Name と照合し、不一致なら起動しない |
 | `backend` | `ipmitool`（v1）。将来 `openipmi` |
-| `interface` | ipmitool の `-I` 値。ローカルは `open` |
+| `interface` | ipmitool の `-I` 値。ローカルは `open`。CLI の `-I` 指定が優先 |
 
 ### `[monitor]`
 
@@ -104,10 +104,10 @@ max_pwm = 100
 
 | キー | 説明 |
 |---|---|
-| `sensor_stale_seconds` | この秒数センサー値が更新されなければ FAILSAFE |
-| `ipmi_failure_limit` | 連続失敗回数の閾値 |
-| `cpu_emergency` / `pch_emergency` | 緊急温度。超過時は 100% PWM |
-| `fail_action` | `irmc-auto`（override 解除） |
+| `sensor_stale_seconds` | センサー陳腐化 FAILSAFE（Phase 5・現在未使用） |
+| `ipmi_failure_limit` | 読み取り/書き込み系それぞれの連続失敗回数の閾値（→ `Degraded`） |
+| `cpu_emergency` / `pch_emergency` | 緊急温度。超過時はモードに関わらず 100% PWM（`Failsafe`） |
+| `fail_action` | `irmc-auto`（override 解除）。現在はこれのみ |
 
 ### `[[curve]]`
 

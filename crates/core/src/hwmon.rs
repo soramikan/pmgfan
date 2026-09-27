@@ -19,7 +19,10 @@ pub const HWMON_ROOT: &str = "/sys/class/hwmon";
 pub fn read_temperatures(hwmon_dir: &Path) -> io::Result<Vec<TempReading>> {
     let mut out = Vec::new();
     for entry in fs::read_dir(hwmon_dir)? {
-        let entry = entry?;
+        // 1エントリの失敗で全センサーを失わないよう skip する
+        let Ok(entry) = entry else {
+            continue;
+        };
         let name_file = entry.path().join("name");
         let Ok(chip) = fs::read_to_string(&name_file) else {
             continue;

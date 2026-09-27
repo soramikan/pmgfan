@@ -7,10 +7,11 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::Arc;
 
+use pmgfan_core::control::ControlParams;
 use pmgfan_core::curve::Curve;
 use pmgfan_core::protocol::{decode_request, encode, Request, Response};
 use pmgfan_ipmi::backend::FanControlBackend;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, RwLock};
 use tracing::warn;
@@ -18,18 +19,13 @@ use tracing::warn;
 use crate::daemon::{apply_mode, Shared};
 
 const SOCKET_GROUP: &str = "pmgfan";
+/// 1接続で受け付ける最大バイト数（プロトコルは1行リクエスト。
+/// 誤動作クライアントの巨大入力でメモリを圧迫しないための上限）。
+const MAX_REQUEST_BYTES: u64 = 16 * 1024;
 
-/// socket を bind し、接続ごとにタスクを立てて処理する。
-pub async fn serve<B>(
-    path: &Path,
-    backend: Arc<B>,
-    shared: Arc<RwLock<Shared>>,
-    curves: Arc<Vec<Curve>>,
-    ctrl: Arc<Mutex<()>>,
-) -> std::io::Result<()>
-where
-    B: FanControlBackend + Send + Sync + 'static,
-{
+/// socket を bind し、権限を設定する。`READY=1` より先に完了させる
+/// ため、serve の spawn 前に呼ぶ。
+pub fn bind(path: &Path) -> std::io::Result<UnixListener> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o750))?;
@@ -40,7 +36,21 @@ where
     let listener = UnixListener::bind(path)?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660))?;
     chown_to_group(path);
+    Ok(listener)
+}
 
+/// 接続ごとにタスクを立てて処理する。
+pub async fn serve<B>(
+    listener: UnixListener,
+    backend: Arc<B>,
+    shared: Arc<RwLock<Shared>>,
+    curves: Arc<Vec<Curve>>,
+    ctrl: Arc<Mutex<()>>,
+    params: ControlParams,
+) -> std::io::Result<()>
+where
+    B: FanControlBackend + Send + Sync + 'static,
+{
     loop {
         let (conn, _) = listener.accept().await?;
         let backend = Arc::clone(&backend);
@@ -48,7 +58,7 @@ where
         let curves = Arc::clone(&curves);
         let ctrl = Arc::clone(&ctrl);
         tokio::spawn(async move {
-            if let Err(e) = handle(conn, &*backend, &shared, &curves, &ctrl).await {
+            if let Err(e) = handle(conn, &*backend, &shared, &curves, &ctrl, &params).await {
                 warn!(error = %e, "ipc connection failed");
             }
         });
@@ -78,11 +88,13 @@ async fn handle<B: FanControlBackend>(
     shared: &RwLock<Shared>,
     curves: &[Curve],
     ctrl: &Mutex<()>,
+    params: &ControlParams,
 ) -> std::io::Result<()> {
     let (r, mut w) = conn.into_split();
-    let mut lines = BufReader::new(r).lines();
+    // 読み取り総量に上限を設け、巨大な1行でメモリを食われないようにする
+    let mut lines = BufReader::new(r.take(MAX_REQUEST_BYTES)).lines();
     while let Some(line) = lines.next_line().await? {
-        let resp = dispatch(&line, backend, shared, curves, ctrl).await;
+        let resp = dispatch(&line, backend, shared, curves, ctrl, params).await;
         let mut out = encode(&resp).unwrap_or_else(|_| {
             r#"{"version":1,"type":"error","error":"encode failed"}"#.to_string()
         });
@@ -98,6 +110,7 @@ async fn dispatch<B: FanControlBackend>(
     shared: &RwLock<Shared>,
     curves: &[Curve],
     ctrl: &Mutex<()>,
+    params: &ControlParams,
 ) -> Response {
     let req = match decode_request(line) {
         Ok(r) => r,
@@ -117,10 +130,11 @@ async fn dispatch<B: FanControlBackend>(
                 uptime_secs: s.started.elapsed().as_secs_f64(),
             }
         }
-        Request::SetMode { mode } => match apply_mode(backend, shared, ctrl, curves, &mode).await
-        {
-            Ok(()) => Response::Ok,
-            Err(e) => Response::Error { error: e },
-        },
+        Request::SetMode { mode } => {
+            match apply_mode(backend, shared, ctrl, params, curves, &mode).await {
+                Ok(()) => Response::Ok,
+                Err(e) => Response::Error { error: e },
+            }
+        }
     }
 }

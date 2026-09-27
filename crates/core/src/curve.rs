@@ -81,11 +81,15 @@ impl Curve {
     }
 
     /// 線形補間で `temp` ℃ → PWM %。範囲外は端点にクランプする。
+    /// 非有限値入力は壊れたセンサーとして安全側（末端点 = 通常最大値）を返す。
     pub fn eval(&self, temp: f32) -> f32 {
         let pts = &self.points;
         debug_assert!(!pts.is_empty());
         if pts.is_empty() {
             return 0.0;
+        }
+        if !temp.is_finite() {
+            return pts[pts.len() - 1].pwm;
         }
         if temp <= pts[0].temp {
             return pts[0].pwm;
@@ -129,6 +133,14 @@ mod tests {
         assert!((c.eval(42.5) - 32.5).abs() < 1e-6);
         // 50℃ でちょうど 35
         assert_eq!(c.eval(50.0), 35.0);
+    }
+
+    #[test]
+    fn eval_non_finite_temp_goes_to_last_point() {
+        let c = cpu_curve();
+        // 壊れたセンサー入力は安全側（最大要求）に倒す
+        assert_eq!(c.eval(f32::NAN), 100.0);
+        assert_eq!(c.eval(f32::INFINITY), 100.0);
     }
 
     #[test]

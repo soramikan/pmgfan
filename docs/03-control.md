@@ -137,8 +137,17 @@ apply tick (min_apply_interval_ms)
                    state=Degraded（iRMC Auto へ退避）
 ```
 
+- **緊急温度チェック**: 各 tick で `cpu_package`/`pch` を評価し、
+  `cpu_emergency`/`pch_emergency` 超過ならモードに関わらず
+  100% PWM を強制（`state = Failsafe`）
+- **センサー一部欠落**: 解決不能なカーブは要求合成から外れ、
+  解決できたカーブのみで制御を継続する（warn ログ）。全滅した
+  ときだけ上記のフェイルセーフ退避になる
+
 - **モード変更**: `mode_generation` カウンタをインクリメントし、
-  制御ループが変化を検知して RateLimiter をリセットする
+  制御ループが変化を検知して RateLimiter をリセットする。
+  その際 `pwm`（実際に適用中の値）でリミッタをシードし、
+  モード切替直後に目標値へ直行する急変を防ぐ
 - **直列化**: 制御ループの PWM 操作と `apply_mode` の
   `IrmcAuto` 即時解除は同一ミューテックス（`ctrl`）を取る。
   「モード表示は Auto なのに override が残る」レースを防ぐ

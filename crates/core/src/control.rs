@@ -57,6 +57,15 @@ impl RateLimiter {
         self.descending = false;
     }
 
+    /// 実際に適用中の PWM をシードする。
+    /// モード変更直後に `shared.pwm` の実値を入れることで、
+    /// 次の `next()` が「初回適用」として目標値に直行せず、
+    /// 現在値からの滑らかな変化になる。
+    pub fn prime(&mut self, current: u8) {
+        self.current = Some(current.clamp(self.params.min_pwm, self.params.max_pwm));
+        self.descending = false;
+    }
+
     /// 現在の適用値（まだ一度も書いていなければ None）。
     pub fn current(&self) -> Option<u8> {
         self.current

@@ -16,24 +16,34 @@ use pmgfan_core::sensor::{self, TempReading};
 use pmgfan_ipmi::backend::FanControlBackend;
 use pmgfan_ipmi::fujitsu;
 use tokio::net::UnixDatagram;
-use tokio::sync::{Mutex, RwLock};
-use tokio::time::interval;
+use tokio::sync::{Mutex, Notify, RwLock};
+use tokio::time::{interval, MissedTickBehavior};
 use tracing::{error, info, warn};
 
 use crate::ipc;
 
 /// PWM 値が変わらなくても強制値を再送する間隔（適用 tick 数）。
 const REASSERT_TICKS: u32 = 6;
+/// 緊急温度超過時に強制する PWM。
+const EMERGENCY_PWM: u8 = 100;
+/// シャットダウン時に制御ループの終了を待つ上限。
+const SHUTDOWN_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// デーモン動作パラメータ（config または既定値から構築）。
 #[derive(Debug, Clone)]
 pub struct Params {
     pub socket_path: PathBuf,
-    pub poll_interval: Duration,
+    pub fan_interval: Duration,
+    pub temp_interval: Duration,
     pub apply_interval: Duration,
     pub control: ControlParams,
     pub curves: Vec<Curve>,
     pub startup_mode: Mode,
+    pub ipmi_failure_limit: u32,
+    pub cpu_emergency: f32,
+    pub pch_emergency: f32,
+    /// 起動時に FRU 製品名を照合する期待値
+    pub expected_model: String,
 }
 
 /// デーモンの共有状態。
@@ -51,7 +61,14 @@ pub struct Shared {
     pub temps: Vec<TempReading>,
     /// 直近の IPMI エラー（診断用）
     pub last_error: Option<String>,
-    pub ipmi_failures: u32,
+    /// 読み取り系の連続失敗。それぞれ独立して数え、
+    /// 片方の成功で他方をリセットしない
+    pub fan_failures: u32,
+    pub temp_failures: u32,
+    /// 書き込み系の連続失敗
+    pub write_failures: u32,
+    /// 最後にファン読み取りが成功した時刻（watchdog の鮮度判定用）
+    pub last_poll_ok: Instant,
     pub started: Instant,
 }
 
@@ -65,9 +82,20 @@ impl Shared {
             fans: Vec::new(),
             temps: Vec::new(),
             last_error: None,
-            ipmi_failures: 0,
+            fan_failures: 0,
+            temp_failures: 0,
+            write_failures: 0,
+            last_poll_ok: Instant::now(),
             started: Instant::now(),
         }
+    }
+}
+
+/// mode に対応する「正常時」の状態。
+fn normal_state(mode: &Mode) -> DaemonState {
+    match mode {
+        Mode::IrmcAuto => DaemonState::Monitoring,
+        _ => DaemonState::Controlling,
     }
 }
 
@@ -91,146 +119,314 @@ where
         .unwrap_or_else(|| PathBuf::from("/run/pmgfand"));
     let _instance_lock = acquire_instance_lock(&run_dir)?;
 
-    // センサーポーリング
-    let poll = {
-        let backend = Arc::clone(&backend);
-        let shared = Arc::clone(&shared);
-        let poll_interval = params.poll_interval;
-        tokio::spawn(async move { poll_loop(&*backend, &shared, poll_interval).await })
-    };
+    // 機種検証: 想定外の機種に OEM raw コマンドを送らない
+    // （docs/02「想定外であれば制御を開始しない」）。
+    match backend.model_name().await {
+        Ok(model) if model.contains(&params.expected_model) => {
+            info!(model = %model, "product model verified");
+        }
+        Ok(model) => bail!("unexpected product '{model}' (expected '{}')", params.expected_model),
+        Err(e) => bail!("cannot verify product model: {e}"),
+    }
 
     // PWM/override 操作の直列化ロック。制御ループの書き込みと
     // apply_mode の即時解除が入れ違いで「iRMC Auto 表示のまま
     // override が残る」ことを防ぐ。
     let ctrl = Arc::new(Mutex::new(()));
 
+    // 終了通知。制御ループはこれを見て現在の処理を完了してから返る
+    // （abort すると ipmitool 子プロセスが孤児になり、clear 後に
+    // 強制値が着地する可能性があるため graceful にする）。
+    let shutdown = Arc::new(Notify::new());
+
+    // ファン RPM ポーリング
+    let poll_fans = {
+        let backend = Arc::clone(&backend);
+        let shared = Arc::clone(&shared);
+        let shutdown = Arc::clone(&shutdown);
+        let fan_interval = params.fan_interval;
+        let limit = params.ipmi_failure_limit;
+        tokio::spawn(async move {
+            poll_fans_loop(&*backend, &shared, &shutdown, fan_interval, limit).await
+        })
+    };
+
+    // 温度ポーリング（IPMI + hwmon）
+    let poll_temps = {
+        let backend = Arc::clone(&backend);
+        let shared = Arc::clone(&shared);
+        let shutdown = Arc::clone(&shutdown);
+        let temp_interval = params.temp_interval;
+        let limit = params.ipmi_failure_limit;
+        tokio::spawn(async move {
+            poll_temps_loop(&*backend, &shared, &shutdown, temp_interval, limit).await
+        })
+    };
+
     // 制御ループ（PWM 書き込みの単一主体）
     let control = {
         let backend = Arc::clone(&backend);
         let shared = Arc::clone(&shared);
         let ctrl = Arc::clone(&ctrl);
+        let shutdown = Arc::clone(&shutdown);
         let apply_interval = params.apply_interval;
         let control_params = params.control;
         let curves = params.curves.clone();
+        let limit = params.ipmi_failure_limit;
+        let (cpu_em, pch_em) = (params.cpu_emergency, params.pch_emergency);
         tokio::spawn(async move {
-            control_loop(&*backend, &shared, &ctrl, control_params, &curves, apply_interval)
-                .await
+            control_loop(
+                &*backend,
+                &shared,
+                &ctrl,
+                &shutdown,
+                control_params,
+                &curves,
+                apply_interval,
+                limit,
+                cpu_em,
+                pch_em,
+            )
+            .await
         })
     };
 
-    // Unix socket
+    // Unix socket（READY=1 より先に bind を完了させる）
+    let listener = ipc::bind(&socket_path)?;
     let ipc_task = {
         let backend = Arc::clone(&backend);
         let shared = Arc::clone(&shared);
         let curves = Arc::new(params.curves.clone());
-        let path = socket_path.clone();
-        tokio::spawn(async move { ipc::serve(&path, backend, shared, curves, ctrl).await })
+        let ctrl = Arc::clone(&ctrl);
+        let control_params = params.control;
+        tokio::spawn(async move {
+            ipc::serve(listener, backend, shared, curves, ctrl, control_params).await
+        })
     };
 
-    // systemd watchdog（WATCHDOG_USEC があれば半周期でキック）
-    spawn_watchdog();
+    // systemd watchdog（WATCHDOG_USEC があれば半周期でキック。
+    // ただしファン読み取りの鮮度が保たれている間だけ送る）
+    spawn_watchdog(Arc::clone(&shared));
 
     // 起動モードを反映
-    {
-        let mut s = shared.write().await;
-        s.state = match s.mode {
-            Mode::IrmcAuto => DaemonState::Monitoring,
-            _ => DaemonState::Controlling,
-        };
-        if s.mode == Mode::IrmcAuto {
-            // 前回の強制が残っている可能性を潰す
-            if let Err(e) = backend.clear_override().await {
-                warn!(error = %e, "startup clear_override failed");
-            }
+    let startup_is_auto = {
+        let s = shared.read().await;
+        s.mode == Mode::IrmcAuto
+    };
+    shared.write().await.state = if startup_is_auto {
+        DaemonState::Monitoring
+    } else {
+        DaemonState::Controlling
+    };
+    if startup_is_auto {
+        // 前回プロセスの強制が残っている可能性を潰す。
+        // 制御ループと直列化して実行する。
+        let _ctrl = ctrl.lock().await;
+        if let Err(e) = backend.clear_override().await {
+            warn!(error = %e, "startup clear_override failed");
+            let mut s = shared.write().await;
+            s.state = DaemonState::Degraded;
+            s.last_error = Some(e.to_string());
         }
     }
     sd_notify("READY=1").await;
     info!(socket = %socket_path.display(), mode = ?params.startup_mode, "pmgfand started");
 
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => info!("SIGINT received"),
-        _ = sigterm.recv() => info!("SIGTERM received"),
-        r = poll => error!(?r, "poller exited"),
-        r = control => error!(?r, "control loop exited"),
-        r = ipc_task => error!(?r, "ipc server exited"),
+    let mut poll_fans = poll_fans;
+    let mut poll_temps = poll_temps;
+    let mut control = control;
+    let mut ipc_task = ipc_task;
+    // どこかのタスクが先に終わった場合は異常終了として扱い、
+    // systemd に再起動させる（exit code != 0）。
+    let fatal: Option<String> = tokio::select! {
+        _ = tokio::signal::ctrl_c() => { info!("SIGINT received"); None }
+        _ = sigterm.recv() => { info!("SIGTERM received"); None }
+        r = &mut poll_fans => Some(format!("fan poller exited: {r:?}")),
+        r = &mut poll_temps => Some(format!("temp poller exited: {r:?}")),
+        r = &mut control => Some(format!("control loop exited: {r:?}")),
+        r = &mut ipc_task => Some(format!("ipc server exited: {r:?}")),
+    };
+    if let Some(e) = &fatal {
+        error!("{e}");
     }
 
-    // シャットダウン: 必ず iRMC 自動制御へ戻す
+    // シャットダウン: 制御ループに終了を通知し、in-flight の
+    // 書き込みが完了するのを待ってから override を解除する。
     info!("shutting down; clearing OEM override");
-    if let Err(e) = backend.clear_override().await {
-        error!(error = %e, "failed to clear override on shutdown");
+    shutdown.notify_waiters();
+    if tokio::time::timeout(SHUTDOWN_JOIN_TIMEOUT, &mut control)
+        .await
+        .is_err()
+    {
+        warn!("control loop did not stop in time; aborting");
+        control.abort();
+    }
+    poll_fans.abort();
+    poll_temps.abort();
+    ipc_task.abort();
+    {
+        // 制御ループの書き込みと直列化（ここに来る時点で既に
+        // 止まっているはずだが、apply_mode の解除と順序を合わせる）
+        let _ctrl = ctrl.lock().await;
+        if let Err(e) = backend.clear_override().await {
+            error!(error = %e, "failed to clear override on shutdown");
+        }
     }
     sd_notify("STOPPING=1").await;
     let _ = std::fs::remove_file(&socket_path);
-    Ok(())
+
+    match fatal {
+        Some(e) => bail!(e),
+        None => Ok(()),
+    }
 }
 
-async fn poll_loop<B: FanControlBackend>(
+async fn poll_fans_loop<B: FanControlBackend>(
     backend: &B,
     shared: &RwLock<Shared>,
+    shutdown: &Notify,
     poll_interval: Duration,
+    failure_limit: u32,
 ) {
     let mut tick = interval(poll_interval);
+    tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
-        tick.tick().await;
+        tokio::select! {
+            _ = tick.tick() => {}
+            _ = shutdown.notified() => return,
+        }
+        // IPMI 呼び出しはロックの外で行い、結果のコミットだけ
+        // ロックを取る（ロック越し IO は解除操作をブロックする）。
+        let result = backend.fans().await;
         let mut s = shared.write().await;
-        match backend.fans().await {
+        match result {
             Ok(fans) => {
                 s.fans = fans;
-                s.ipmi_failures = 0;
+                s.fan_failures = 0;
+                s.last_poll_ok = Instant::now();
                 s.last_error = None;
+                if s.state == DaemonState::Degraded {
+                    s.state = normal_state(&s.mode);
+                }
             }
             Err(e) => {
-                s.ipmi_failures += 1;
+                s.fan_failures += 1;
                 s.last_error = Some(e.to_string());
-                if s.ipmi_failures >= 3 {
+                if s.fan_failures >= failure_limit {
                     s.state = DaemonState::Degraded;
-                    warn!(failures = s.ipmi_failures, error = %e, "ipmi polling failing");
+                    warn!(failures = s.fan_failures, error = %e, "ipmi fan polling failing");
                 }
             }
         }
-        match backend.temperatures().await {
+    }
+}
+
+async fn poll_temps_loop<B: FanControlBackend>(
+    backend: &B,
+    shared: &RwLock<Shared>,
+    shutdown: &Notify,
+    poll_interval: Duration,
+    failure_limit: u32,
+) {
+    let mut tick = interval(poll_interval);
+    tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = tick.tick() => {}
+            _ = shutdown.notified() => return,
+        }
+        let result = backend.temperatures().await;
+        let hw = read_hwmon();
+        let mut s = shared.write().await;
+        match result {
             Ok(mut temps) => {
-                temps.extend(read_hwmon());
+                temps.extend(hw);
                 s.temps = temps;
+                s.temp_failures = 0;
             }
             Err(e) => {
                 // IPMI 温度が取れなくても hwmon だけは更新する
-                s.temps = read_hwmon();
-                warn!(error = %e, "ipmi temperature read failed");
+                s.temps = hw;
+                s.temp_failures += 1;
+                if s.temp_failures >= failure_limit {
+                    s.state = DaemonState::Degraded;
+                }
+                warn!(failures = s.temp_failures, error = %e, "ipmi temperature read failed");
             }
         }
     }
+}
+
+/// 緊急温度チェック。閾値を超えたセンサーがあれば `(name, temp)`。
+fn emergency_check(temps: &[TempReading], cpu_em: f32, pch_em: f32) -> Option<(String, f64)> {
+    for (sensor_name, limit) in [("cpu_package", cpu_em), ("pch", pch_em)] {
+        if let Some(t) = sensor::resolve(temps, sensor_name) {
+            if t.celsius as f32 >= limit {
+                return Some((sensor_name.to_string(), t.celsius));
+            }
+        }
+    }
+    None
 }
 
 /// 制御ループ。PWM への書き込みはここだけが行う
 /// （`apply_mode` の IrmcAuto 即時解除を除く）。
+#[allow(clippy::too_many_arguments)]
 async fn control_loop<B: FanControlBackend>(
     backend: &B,
     shared: &RwLock<Shared>,
     ctrl: &Mutex<()>,
+    shutdown: &Notify,
     params: ControlParams,
     curves: &[Curve],
     apply_interval: Duration,
+    failure_limit: u32,
+    cpu_emergency: f32,
+    pch_emergency: f32,
 ) {
     let mut limiter = RateLimiter::new(params);
     let mut seen_gen = 0u64;
     let mut ticks_since_write = 0u32;
+    let mut missing_sensors: Vec<String> = Vec::new();
     let mut tick = interval(apply_interval);
+    tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     loop {
-        tick.tick().await;
+        tokio::select! {
+            _ = tick.tick() => {}
+            _ = shutdown.notified() => return,
+        }
         // PWM 操作は apply_mode の即時解除と直列化する
         let _ctrl = ctrl.lock().await;
-        let (mode, gen, temps) = {
+        let (mode, gen, temps, applied_pwm) = {
             let s = shared.read().await;
-            (s.mode.clone(), s.mode_generation, s.temps.clone())
+            (
+                s.mode.clone(),
+                s.mode_generation,
+                s.temps.clone(),
+                s.pwm,
+            )
         };
         if gen != seen_gen {
             limiter.reset();
+            // 現在適用中の値から変化を継続する
+            // （モード変更直後に目標へ直行するのを防ぐ）
+            if let Some(p) = applied_pwm {
+                limiter.prime(p);
+            }
             ticks_since_write = 0;
             seen_gen = gen;
+        }
+
+        // 緊急温度: モードに関わらず 100% 強制が最優先
+        if let Some((sensor_name, t)) = emergency_check(&temps, cpu_emergency, pch_emergency) {
+            warn!(sensor = %sensor_name, temp = t, "emergency temperature; forcing 100% pwm");
+            write_pwm(backend, shared, EMERGENCY_PWM, failure_limit).await;
+            let mut s = shared.write().await;
+            s.state = DaemonState::Failsafe;
+            s.last_error = Some(format!("emergency: {sensor_name} {t:.1}C"));
+            continue;
         }
 
         match mode {
@@ -239,41 +435,53 @@ async fn control_loop<B: FanControlBackend>(
                 // 外部要因で解除される可能性に備え周期再アサート。
                 // ただし値が変わった tick で即時書き込み、変わらなければ
                 // REASSERT_TICKS ごとに再送する。
-                let cur = { shared.read().await.pwm };
                 ticks_since_write += 1;
-                if cur != Some(p) || ticks_since_write >= REASSERT_TICKS {
-                    write_pwm(backend, shared, p).await;
+                if applied_pwm != Some(p) || ticks_since_write >= REASSERT_TICKS {
+                    write_pwm(backend, shared, p, failure_limit).await;
                     ticks_since_write = 0;
                 }
             }
             Mode::Curve => {
-                let target = curve_demand(curves, &temps);
+                // 初回ポーリング完了前（temps 空）に誤って
+                // 「センサー全滅」判定しないようスキップする
+                if temps.is_empty() {
+                    continue;
+                }
+                let (target, missing) = curve_demand(curves, &temps);
+                // 新たに解決不能になったセンサーだけ warn（ログスパム防止）
+                for name in missing.iter().filter(|n| !missing_sensors.contains(n)) {
+                    warn!(sensor = %name, "curve sensor not readable");
+                }
+                missing_sensors = missing;
                 match target {
                     None => {
-                        // 参照センサーが全滅 → 独自制御は捨てて iRMC へ戻す
+                        // 参照センサーが全滅 → 独自制御は捨てて iRMC へ戻す。
+                        // clear 失敗時は pwm を Some のまま残し次 tick で再試行する。
                         let needs_clear = shared.read().await.pwm.is_some();
                         if needs_clear {
                             warn!("no curve sensors readable; clearing override (iRMC auto)");
-                            if let Err(e) = backend.clear_override().await {
-                                error!(error = %e, "clear_override failed");
+                            match backend.clear_override().await {
+                                Ok(()) => shared.write().await.pwm = None,
+                                Err(e) => {
+                                    let mut s = shared.write().await;
+                                    s.write_failures += 1;
+                                    s.last_error = Some(e.to_string());
+                                    error!(error = %e, "clear_override failed; will retry");
+                                }
                             }
                         }
-                        let mut s = shared.write().await;
-                        if needs_clear {
-                            s.pwm = None;
-                        }
-                        s.state = DaemonState::Degraded;
+                        shared.write().await.state = DaemonState::Degraded;
                     }
                     Some(target) => match limiter.next(target) {
                         Some(p) => {
-                            write_pwm(backend, shared, p).await;
+                            write_pwm(backend, shared, p, failure_limit).await;
                             ticks_since_write = 0;
                         }
                         None => {
                             ticks_since_write += 1;
                             if ticks_since_write >= REASSERT_TICKS {
                                 if let Some(p) = limiter.current() {
-                                    write_pwm(backend, shared, p).await;
+                                    write_pwm(backend, shared, p, failure_limit).await;
                                 }
                                 ticks_since_write = 0;
                             }
@@ -290,38 +498,50 @@ async fn control_loop<B: FanControlBackend>(
     }
 }
 
-/// 全カーブを現在温度で評価し、最大要求 PWM を返す。
+/// 全カーブを現在温度で評価し、最大要求 PWM と
+/// 解決不能だったセンサー名の一覧を返す。
 /// 1つも解決できなければ `None`。
-fn curve_demand(curves: &[Curve], temps: &[TempReading]) -> Option<u8> {
-    curves
-        .iter()
-        .filter_map(|c| {
-            let t = sensor::resolve(temps, &c.sensor);
-            if t.is_none() {
-                warn!(sensor = %c.sensor, "curve sensor not readable");
+///
+/// 一部のセンサーが解決不能でも、解決できたカーブの最大値で
+/// 制御を継続する（解決不能なカーブは要求に参加しない。
+/// 「全滅」したときだけフェイルセーフへ退避する）。
+fn curve_demand(curves: &[Curve], temps: &[TempReading]) -> (Option<u8>, Vec<String>) {
+    let mut demand = None;
+    let mut missing = Vec::new();
+    for c in curves {
+        match sensor::resolve(temps, &c.sensor) {
+            Some(t) => {
+                let p = c.eval(t.celsius as f32).round().clamp(0.0, 100.0) as u8;
+                demand = Some(demand.map_or(p, |d: u8| d.max(p)));
             }
-            t.map(|t| c.eval(t.celsius as f32).round().clamp(0.0, 100.0) as u8)
-        })
-        .max()
+            None => missing.push(c.sensor.clone()),
+        }
+    }
+    (demand, missing)
 }
 
-async fn write_pwm<B: FanControlBackend>(backend: &B, shared: &RwLock<Shared>, pwm: u8) {
+async fn write_pwm<B: FanControlBackend>(
+    backend: &B,
+    shared: &RwLock<Shared>,
+    pwm: u8,
+    failure_limit: u32,
+) {
     match backend.set_global_pwm(pwm).await {
         Ok(()) => {
             let mut s = shared.write().await;
             s.pwm = Some(pwm);
-            s.state = DaemonState::Controlling;
-            s.ipmi_failures = 0;
+            s.state = normal_state(&s.mode);
+            s.write_failures = 0;
             s.last_error = None;
         }
         Err(e) => {
             let mut s = shared.write().await;
-            s.ipmi_failures += 1;
+            s.write_failures += 1;
             s.last_error = Some(e.to_string());
-            if s.ipmi_failures >= 3 {
+            if s.write_failures >= failure_limit {
                 s.state = DaemonState::Degraded;
             }
-            warn!(error = %e, "pwm write failed");
+            warn!(failures = s.write_failures, error = %e, "pwm write failed");
         }
     }
 }
@@ -358,6 +578,7 @@ pub async fn apply_mode<B: FanControlBackend>(
     backend: &B,
     shared: &RwLock<Shared>,
     ctrl: &Mutex<()>,
+    params: &ControlParams,
     curves: &[Curve],
     mode: &Mode,
 ) -> std::result::Result<(), String> {
@@ -366,7 +587,12 @@ pub async fn apply_mode<B: FanControlBackend>(
             // 制御ループの書き込みと直列化。ここが先なら次 tick で
             // Auto を見て書き込みを止め、後ならこの解除が最終状態になる。
             let _ctrl = ctrl.lock().await;
-            backend.clear_override().await.map_err(|e| e.to_string())?;
+            if let Err(e) = backend.clear_override().await {
+                let mut s = shared.write().await;
+                s.write_failures += 1;
+                s.last_error = Some(e.to_string());
+                return Err(e.to_string());
+            }
             let mut s = shared.write().await;
             s.mode = Mode::IrmcAuto;
             s.mode_generation += 1;
@@ -376,13 +602,13 @@ pub async fn apply_mode<B: FanControlBackend>(
             Ok(())
         }
         Mode::FixedPwm(p) => {
-            if *p > fujitsu::MAX_PWM {
-                return Err(format!("pwm must be 0..=100, got {p}"));
+            if *p > params.max_pwm {
+                return Err(format!("pwm {p}% is above configured max {}%", params.max_pwm));
             }
-            if *p < fujitsu::MIN_SAFE_PWM {
+            let floor = params.min_pwm.max(fujitsu::MIN_SAFE_PWM);
+            if *p < floor {
                 return Err(format!(
-                    "pwm {p}% is below the safety floor {}%",
-                    fujitsu::MIN_SAFE_PWM
+                    "pwm {p}% is below the allowed floor {floor}%"
                 ));
             }
             let mut s = shared.write().await;
@@ -420,7 +646,12 @@ pub async fn sd_notify(msg: &str) {
 
 /// systemd が WATCHDOG_USEC を設定していれば、その半周期で
 /// `WATCHDOG=1` を送り続けるタスクを起動する。
-fn spawn_watchdog() {
+///
+/// ただしファンポーリングの鮮度が watchdog 周期内に保たれて
+/// いるときだけ送る。ポーリングがハング（ipmitool wedged 等）
+/// しているときはキックを止め、systemd に検出・再起動させる
+/// （docs/04「プロセスハングまで考慮」）。
+fn spawn_watchdog(shared: Arc<RwLock<Shared>>) {
     let Ok(usec) = std::env::var("WATCHDOG_USEC") else {
         return;
     };
@@ -430,13 +661,213 @@ fn spawn_watchdog() {
     if usec == 0 {
         return;
     }
-    let half = Duration::from_micros(usec) / 2;
+    let period = Duration::from_micros(usec);
+    let half = period / 2;
     tokio::spawn(async move {
         let mut t = interval(half);
         loop {
             t.tick().await;
-            sd_notify("WATCHDOG=1").await;
+            let fresh = shared.read().await.last_poll_ok.elapsed() < period;
+            if fresh {
+                sd_notify("WATCHDOG=1").await;
+            } else {
+                warn!("fan polling stale; suppressing watchdog kick");
+            }
         }
     });
     info!(watchdog_usec = usec, "systemd watchdog enabled");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pmgfan_core::sensor::TempReading;
+    use pmgfan_ipmi::backend::{IpmiError, PwmSlot, Result as IpmiResult};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    /// モックバックエンド。呼び出し回数と現在の強制値を記録する。
+    struct MockBackend {
+        model: String,
+        pwm: Mutex<Option<u8>>,
+        clear_calls: AtomicUsize,
+        fail_clear: AtomicBool,
+        fail_write: AtomicBool,
+        temps: Vec<TempReading>,
+    }
+
+    impl MockBackend {
+        fn new() -> Self {
+            Self {
+                model: "PRIMERGY TX1320 M4".into(),
+                pwm: Mutex::new(None),
+                clear_calls: AtomicUsize::new(0),
+                fail_clear: AtomicBool::new(false),
+                fail_write: AtomicBool::new(false),
+                temps: Vec::new(),
+            }
+        }
+    }
+
+    impl FanControlBackend for MockBackend {
+        fn model_name(&self) -> impl std::future::Future<Output = IpmiResult<String>> + Send {
+            async move { Ok(self.model.clone()) }
+        }
+        fn fans(&self) -> impl std::future::Future<Output = IpmiResult<Vec<FanReading>>> + Send {
+            async move { Ok(Vec::new()) }
+        }
+        fn temperatures(
+            &self,
+        ) -> impl std::future::Future<Output = IpmiResult<Vec<TempReading>>> + Send {
+            async move { Ok(self.temps.clone()) }
+        }
+        fn set_global_pwm(&self, pwm: u8) -> impl std::future::Future<Output = IpmiResult<()>> + Send {
+            async move {
+                if self.fail_write.load(Ordering::SeqCst) {
+                    return Err(IpmiError::Parse("mock write failure".into()));
+                }
+                *self.pwm.lock().await = Some(pwm);
+                Ok(())
+            }
+        }
+        fn clear_override(&self) -> impl std::future::Future<Output = IpmiResult<()>> + Send {
+            async move {
+                self.clear_calls.fetch_add(1, Ordering::SeqCst);
+                if self.fail_clear.load(Ordering::SeqCst) {
+                    return Err(IpmiError::Parse("mock clear failure".into()));
+                }
+                *self.pwm.lock().await = None;
+                Ok(())
+            }
+        }
+        fn read_override_slots(
+            &self,
+            _indices: &[u8],
+        ) -> impl std::future::Future<Output = IpmiResult<Vec<PwmSlot>>> + Send {
+            async move { Ok(Vec::new()) }
+        }
+    }
+
+    fn params() -> ControlParams {
+        ControlParams {
+            min_pwm: 30,
+            max_pwm: 100,
+            step_up: 20,
+            step_down: 5,
+            down_hysteresis: 5,
+        }
+    }
+
+    fn shared_with_mode(mode: Mode) -> RwLock<Shared> {
+        RwLock::new(Shared::new(mode))
+    }
+
+    #[tokio::test]
+    async fn apply_mode_fixed_pwm_validates_floor() {
+        let b = MockBackend::new();
+        let s = shared_with_mode(Mode::IrmcAuto);
+        let c = Mutex::new(());
+        // 設定下限未満は拒否
+        assert!(apply_mode(&b, &s, &c, &params(), &[], &Mode::FixedPwm(10))
+            .await
+            .is_err());
+        // 上限超過も拒否
+        assert!(apply_mode(&b, &s, &c, &params(), &[], &Mode::FixedPwm(101))
+            .await
+            .is_err());
+        // 範囲内は受け付けてモード反映
+        assert!(apply_mode(&b, &s, &c, &params(), &[], &Mode::FixedPwm(40))
+            .await
+            .is_ok());
+        let s = s.read().await;
+        assert_eq!(s.mode, Mode::FixedPwm(40));
+        assert_eq!(s.mode_generation, 1);
+    }
+
+    #[tokio::test]
+    async fn apply_mode_auto_clears_and_updates_state() {
+        let b = MockBackend::new();
+        let s = shared_with_mode(Mode::Curve);
+        {
+            let mut w = s.write().await;
+            w.pwm = Some(40);
+            w.state = DaemonState::Controlling;
+        }
+        let c = Mutex::new(());
+        apply_mode(&b, &s, &c, &params(), &[], &Mode::IrmcAuto)
+            .await
+            .unwrap();
+        let s = s.read().await;
+        assert_eq!(s.mode, Mode::IrmcAuto);
+        assert_eq!(s.state, DaemonState::Monitoring);
+        assert_eq!(s.pwm, None);
+        assert_eq!(b.clear_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn apply_mode_auto_failure_is_reported() {
+        let b = MockBackend::new();
+        b.fail_clear.store(true, Ordering::SeqCst);
+        let s = shared_with_mode(Mode::Curve);
+        s.write().await.pwm = Some(40);
+        let c = Mutex::new(());
+        assert!(apply_mode(&b, &s, &c, &params(), &[], &Mode::IrmcAuto)
+            .await
+            .is_err());
+        let s = s.read().await;
+        // 失敗時はモード・pwm を変えない（診断だけ残す）
+        assert_eq!(s.mode, Mode::Curve);
+        assert_eq!(s.pwm, Some(40));
+        assert_eq!(s.write_failures, 1);
+        assert!(s.last_error.is_some());
+    }
+
+    #[tokio::test]
+    async fn apply_mode_curve_requires_curves() {
+        let b = MockBackend::new();
+        let s = shared_with_mode(Mode::IrmcAuto);
+        let c = Mutex::new(());
+        assert!(apply_mode(&b, &s, &c, &params(), &[], &Mode::Curve)
+            .await
+            .is_err());
+    }
+
+    #[test]
+    fn emergency_check_triggers_on_threshold() {
+        let temps = vec![
+            TempReading {
+                chip: "ipmi".into(),
+                label: "CPU".into(),
+                celsius: 91.0,
+            },
+            TempReading {
+                chip: "ipmi".into(),
+                label: "PCH".into(),
+                celsius: 50.0,
+            },
+        ];
+        assert!(emergency_check(&temps, 90.0, 95.0).is_some());
+        assert!(emergency_check(&temps, 95.0, 95.0).is_none());
+        // センサー自体が無ければ発火しない
+        assert!(emergency_check(&[], 90.0, 95.0).is_none());
+    }
+
+    #[test]
+    fn curve_demand_reports_missing() {
+        let c1 = Curve::new("cpu_package", vec![(30.0, 30.0), (80.0, 80.0)]).unwrap();
+        let c2 = Curve::new("nonexistent", vec![(30.0, 30.0), (80.0, 80.0)]).unwrap();
+        let temps = vec![TempReading {
+            chip: "ipmi".into(),
+            label: "CPU".into(),
+            celsius: 40.0,
+        }];
+        let (demand, missing) = curve_demand(&[c1, c2], &temps);
+        assert!(demand.is_some()); // 解決できたカーブだけで最大値
+        assert_eq!(missing, vec!["nonexistent".to_string()]);
+        // 全滅
+        let (demand, _) = curve_demand(
+            &[Curve::new("zzz", vec![(30.0, 30.0), (80.0, 80.0)]).unwrap()],
+            &temps,
+        );
+        assert_eq!(demand, None);
+    }
 }

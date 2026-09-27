@@ -29,21 +29,37 @@ FAN1 SYS = 0 RPM
 daemon shutdown
 ```
 
-### 実装済み（Phase 4 時点）
+### 実装済み
 
 - **curve センサー全滅**: カーブ参照センサーが1つも解決
   できない tick で `clear_override` を実行し iRMC Auto へ退避
-  （`state = Degraded`）
-- **IPMI 連続失敗**: ファン読み取り・PWM 書き込みの連続失敗が
-  `ipmi_failure_limit`（既定3）に達すると `state = Degraded`
+  （`state = Degraded`）。解除失敗時は次 tick で再試行する
+- **緊急温度**: `cpu_emergency` / `pch_emergency` 超過時は
+  モードに関わらず 100% PWM を強制し `state = Failsafe` へ
+  （docs/03 のカーブ誤設定に対する最後の砦）
+- **IPMI 連続失敗**: 読み取り（fan/temp）・書き込み系の
+  連続失敗がそれぞれ `ipmi_failure_limit`（既定3）に達すると
+  `state = Degraded`。回復時はモードに応じた状態へ戻る
+- **機種検証**: 起動時に FRU の Product Name を `device.model`
+  と照合し、不一致・取得失敗では起動しない（fail-closed）
 - **モード変更の直列化**: `apply_mode` の iRMC Auto 即時解除と
   制御ループの PWM 書き込みは同一ミューテックスで直列化し、
   「Auto 表示なのに override が残る」レースを防ぐ
-- **daemon shutdown**: SIGTERM/SIGINT で必ず `clear_override`
-  を実行してから終了（実機検証済み）
+- **daemon shutdown**: SIGTERM/SIGINT で制御ループに終了を通知
+  → in-flight の書き込み完了を待機 → `clear_override` を実行
+  してから終了（実機検証済み）
+- **タスク死亡**: 監視・制御・IPC のいずれかが終了した場合、
+  shutdown 処理のあと非0終了し `Restart=on-failure` に委ねる
+- **ipmitool タイムアウト**: 各呼び出しは 15 秒で強制終了し、
+  ハングした子プロセスがループを塞がないようにする
 - **不正設定**: `mode = "curve"` で `[[curve]]` 未定義、
-  `mode = "fixed_pwm"` で `fixed_pwm` 未指定、昇順でない
-  カーブ点などは起動時にエラー終了
+  `mode = "fixed_pwm"` で `fixed_pwm` 未指定/範囲外、
+  `min_pwm < 30` や `min > max`、昇順でないカーブ点などは
+  起動時にエラー終了
+
+未実装: `sensor_stale_seconds`（センサー陳腐化検出）、
+`fail_action` 以外のフェイルアクション、0 RPM 検出
+（いずれも Phase 5 予定）。
 
 ## FAILSAFE の動作
 
@@ -88,6 +104,11 @@ WatchdogSec=15s
 
 デーモンから定期的に `WATCHDOG=1` を送る。推奨される通知間隔は
 watchdog timeout のおおむね半分。
+
+実装では、**ファンポーリングが直近 watchdog 周期内に成功して
+いるときだけ**キックを送る。ポーリングがハングしている場合は
+キックを止め、systemd がサービスを再起動して
+`ExecStopPost` で iRMC Auto へ戻せるようにする。
 
 ## systemd unit
 

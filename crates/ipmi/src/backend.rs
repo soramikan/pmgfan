@@ -44,6 +44,9 @@ pub struct PwmSlot {
 /// `async fn` ではなく `impl Future + Send` 形にして、呼び出し側が
 /// tokio の Send コンテキストで使えることを保証する。
 pub trait FanControlBackend {
+    /// FRU の製品名（例: "PRIMERGY TX1320 M4"）。起動時の機種検証に使う。
+    fn model_name(&self) -> impl std::future::Future<Output = Result<String>> + Send;
+
     /// ファン SDR を読む。
     fn fans(&self) -> impl std::future::Future<Output = Result<Vec<FanReading>>> + Send;
 
