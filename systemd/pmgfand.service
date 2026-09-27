@@ -1,0 +1,27 @@
+[Unit]
+Description=pmgfan: PRIMERGY iRMC Fan Control Daemon
+After=multi-user.target
+
+[Service]
+Type=notify
+ExecStart=/usr/sbin/pmgfand \
+    --config /etc/pmgfand/config.toml
+
+ExecStopPost=/usr/sbin/pmgfand clear-override
+
+Restart=on-failure
+RestartSec=2s
+
+WatchdogSec=15s
+TimeoutStopSec=10s
+
+RuntimeDirectory=pmgfand
+RuntimeDirectoryMode=0750
+
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

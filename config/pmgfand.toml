@@ -1,0 +1,66 @@
+# pmgfand 設定ファイル例
+# インストール先: /etc/pmgfand/config.toml
+# 設計の詳細は docs/08-config.md を参照
+
+[device]
+model = "PRIMERGY TX1320 M4"
+backend = "ipmitool"
+interface = "open"
+
+[monitor]
+fan_interval_ms = 2000
+temperature_interval_ms = 1000
+history_seconds = 900
+
+[control]
+mode = "curve"
+
+min_pwm = 30
+max_pwm = 100
+
+step_up = 20
+step_down = 5
+down_hysteresis = 5
+min_apply_interval_ms = 5000
+
+[safety]
+sensor_stale_seconds = 10
+ipmi_failure_limit = 3
+
+cpu_emergency = 90
+pch_emergency = 95
+
+fail_action = "irmc-auto"
+
+[[curve]]
+sensor = "cpu_package"
+
+points = [
+    [35, 30],
+    [50, 35],
+    [60, 45],
+    [70, 60],
+    [80, 80],
+    [90, 100],
+]
+
+[[curve]]
+sensor = "pch"
+
+points = [
+    [45, 30],
+    [60, 35],
+    [70, 45],
+    [80, 65],
+    [90, 100],
+]
+
+[target_rpm]
+reference_fan = "FAN CPU"
+
+kp = 0.003
+ki = 0.0001
+deadband = 75
+
+min_pwm = 30
+max_pwm = 100
