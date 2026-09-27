@@ -73,19 +73,6 @@ impl IpmitoolBackend {
         Ok(fujitsu::parse_hex_bytes(&stdout))
     }
 
-    /// IPMI 側の温度 SDR を読む（hwmon と併用する）。
-    pub async fn temperatures(&self) -> Result<Vec<TempReading>> {
-        let out = self
-            .output(&[
-                "-c".into(),
-                "sdr".into(),
-                "type".into(),
-                "temperature".into(),
-            ])
-            .await?;
-        Ok(parse_temperatures(&out))
-    }
-
     /// `ipmitool fru print` の生テキスト。
     pub async fn fru(&self) -> Result<String> {
         self.output(&["fru".into(), "print".into()]).await
@@ -104,6 +91,22 @@ impl FanControlBackend for IpmitoolBackend {
                 .output(&["-c".into(), "sdr".into(), "type".into(), "fan".into()])
                 .await?;
             Ok(parse_fans(&out))
+        }
+    }
+
+    fn temperatures(
+        &self,
+    ) -> impl std::future::Future<Output = Result<Vec<TempReading>>> + Send {
+        async move {
+            let out = self
+                .output(&[
+                    "-c".into(),
+                    "sdr".into(),
+                    "type".into(),
+                    "temperature".into(),
+                ])
+                .await?;
+            Ok(parse_temperatures(&out))
         }
     }
 

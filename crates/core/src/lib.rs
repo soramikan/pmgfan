@@ -2,4 +2,5 @@
 
 pub mod fan;
 pub mod hwmon;
+pub mod protocol;
 pub mod sensor;

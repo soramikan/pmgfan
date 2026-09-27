@@ -1,13 +1,21 @@
-//! pmgfand — PRIMERGY TX1320 M4 ファン制御デーモン（Phase 1: 監視 + OEM PWM set/clear）
+//! pmgfand — PRIMERGY TX1320 M4 ファン制御デーモン。
+//!
+//! サブコマンドなしで起動するとデーモンとして動作する
+//! （systemd の ExecStart 想定。socket + 監視ループ）。
+//! その他のサブコマンドは単発操作・診断用。
+
+mod daemon;
+mod ipc;
 
 use std::ffi::OsString;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use pmgfan_core::fan::FanReading;
 use pmgfan_core::hwmon;
+use pmgfan_core::protocol;
 use pmgfan_core::sensor::TempReading;
 use pmgfan_ipmi::backend::FanControlBackend;
 use pmgfan_ipmi::fujitsu;
@@ -20,7 +28,7 @@ const EXPECTED_PRODUCT: &str = "PRIMERGY TX1320 M4";
 #[command(
     name = "pmgfand",
     version,
-    about = "PRIMERGY TX1320 M4 iRMC fan control (Phase 1: monitor + OEM PWM set/clear)"
+    about = "PRIMERGY TX1320 M4 iRMC fan control daemon"
 )]
 struct Cli {
     /// ipmitool バイナリ
@@ -29,12 +37,20 @@ struct Cli {
     /// ipmitool -I のインターフェース
     #[arg(short = 'I', long, global = true, default_value = "open")]
     interface: String,
+    /// 設定ファイル（Phase 4 で有効化予定）
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
+    /// 制御 socket のパス
+    #[arg(long, global = true, default_value_os_t = PathBuf::from(protocol::DEFAULT_SOCKET_PATH))]
+    socket: PathBuf,
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
 }
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// デーモンとして起動（省略時のデフォルト）
+    Run,
     /// 機種・iRMC の疎通と製品名の検証
     Probe,
     /// ファン SDR を1回表示
@@ -67,9 +83,20 @@ enum Cmd {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    tracing_subscriber::fmt()
+        .with_target(false)
+        .with_writer(std::io::stderr)
+        .init();
+
     let backend = IpmitoolBackend::new(&cli.ipmitool, &cli.interface);
 
-    match cli.cmd {
+    match cli.cmd.unwrap_or(Cmd::Run) {
+        Cmd::Run => {
+            if cli.config.is_some() {
+                tracing::warn!("--config is accepted but not yet applied (Phase 4)");
+            }
+            daemon::run(backend, cli.socket).await
+        }
         Cmd::Probe => probe(&backend).await,
         Cmd::Fans => {
             print_fans(&backend.fans().await?);

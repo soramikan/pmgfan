@@ -33,21 +33,24 @@ sudo usermod -aG pmgfan sora
 {"version":1,"type":"get_status"}
 ```
 
-レスポンス:
+レスポンス（Phase 2 実装。`state`/`uptime_secs` を含む）:
 
 ```json
 {
   "version": 1,
-  "mode": "curve",
-  "pwm": 42,
+  "type": "status",
+  "state": "controlling",
+  "mode": {"fixed_pwm": 40},
+  "pwm": 40,
   "fans": [
     {"name":"FAN CPU","rpm":2875,"status":"ok"},
     {"name":"FAN1 SYS","rpm":2400,"status":"ok"}
   ],
-  "temperatures": {
-    "cpu": 44.0,
-    "pch": 57.0
-  }
+  "temperatures": [
+    {"chip":"ipmi","label":"CPU","celsius":36.0},
+    {"chip":"coretemp","label":"Package id 0","celsius":37.0}
+  ],
+  "uptime_secs": 71.2
 }
 ```
 
@@ -76,3 +79,10 @@ iRMC Auto:
 - socket への接続 = 操作権限（読み取りも含めて `pmgfan` グループが必要）
 - pmgfanctl 側に権限はなく、すべての操作は pmgfand 内で検証される
 - 危険な操作（min_pwm 未満の PWM 指定など）はデーモン側で拒否する
+
+## 単一インスタンス
+
+pmgfand は `/run/pmgfand/pmgfand.lock` を `flock(LOCK_EX|LOCK_NB)` で
+排他取得する。2重起動は即座にエラー終了する。これにより、
+旧プロセスの終了処理（socket 削除等）が新プロセスに干渉する
+レースを防ぐ。

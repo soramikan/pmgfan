@@ -3,6 +3,7 @@
 use std::io;
 
 use pmgfan_core::fan::FanReading;
+use pmgfan_core::sensor::TempReading;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -45,6 +46,11 @@ pub struct PwmSlot {
 pub trait FanControlBackend {
     /// ファン SDR を読む。
     fn fans(&self) -> impl std::future::Future<Output = Result<Vec<FanReading>>> + Send;
+
+    /// 温度 SDR を読む。
+    fn temperatures(
+        &self,
+    ) -> impl std::future::Future<Output = Result<Vec<TempReading>>> + Send;
 
     /// 全 PWM チャンネル（0xff）に強制 PWM（%）を設定する。
     fn set_global_pwm(&self, pwm: u8) -> impl std::future::Future<Output = Result<()>> + Send;

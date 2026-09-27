@@ -1,7 +1,9 @@
 //! ファン回転数の読み取りモデル。
 
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
 /// ファン1台分の読み取り結果。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FanReading {
     /// SDR 上のセンサー名。例: `FAN CPU`
     pub name: String,
@@ -44,5 +46,24 @@ impl FanStatus {
             Self::Alarm => "alarm",
             Self::Unknown => "unknown",
         }
+    }
+}
+
+impl Serialize for FanStatus {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for FanStatus {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        Ok(match s.as_str() {
+            "ok" => Self::Ok,
+            "disabled" | "ns" => Self::Disabled,
+            "not-present" | "nr" => Self::NotPresent,
+            "alarm" => Self::Alarm,
+            _ => Self::Unknown,
+        })
     }
 }
