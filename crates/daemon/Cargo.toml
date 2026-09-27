@@ -1,0 +1,16 @@
+[package]
+name = "pmgfand"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "pmgfand"
+path = "src/main.rs"
+
+[dependencies]
+pmgfan-core.workspace = true
+pmgfan-ipmi.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true

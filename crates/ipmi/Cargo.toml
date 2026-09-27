@@ -1,0 +1,10 @@
+[package]
+name = "pmgfan-ipmi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+pmgfan-core.workspace = true
+thiserror.workspace = true
+tokio.workspace = true

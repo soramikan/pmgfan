@@ -78,6 +78,26 @@ ff 00 00
 実機で slot と物理ファンの対応が確定してから扱う
 （[03-control.md](03-control.md) の制約を参照）。
 
+### force スロット読み出し（実機観測）
+
+`R`(0x52) タグで読み出せる。要求 payload:
+
+```text
+80 28 00 | 2d 46 52 01 | <count> | [idx 00]...
+```
+
+応答（実機観測）:
+
+```text
+80 28 00 | 01 | <count> | (index|flags, value)×count
+```
+
+- index バイト: 下位6bit がスロット index、bit7 が強制フラグ
+- value バイト: 強制時は PWM%（例: 40% 強制中 `c0 28`、自動時 `40 59`）
+
+スロット index は 0..=31。`irmc_fan.py` の既定値は `0x00, 0x01, 0x19, 0x1a`。
+`pmgfand read` で確認できる。
+
 ## Backend 抽象化
 
 OEM 制御を trait で隔離する:
