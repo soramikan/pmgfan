@@ -7,14 +7,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use pmgfan_core::control::{ControlParams, RateLimiter};
+use pmgfan_core::control::{ControlParams, PwmScope, RateLimiter};
 use pmgfan_core::curve::Curve;
 use pmgfan_core::fan::FanReading;
 use pmgfan_core::hwmon;
 use pmgfan_core::protocol::{CurveSpec, DaemonState, Mode};
 use pmgfan_core::sensor::{self, TempReading};
 use pmgfan_ipmi::backend::FanControlBackend;
-use pmgfan_ipmi::fujitsu;
 use tokio::net::UnixDatagram;
 use tokio::sync::{watch, Mutex, RwLock};
 use tokio::time::{interval, MissedTickBehavior};
@@ -593,7 +592,14 @@ async fn control_loop<B: FanControlBackend>(
         if let Some((sensor_name, t)) = emergency_check(&temps, cpu_emergency, pch_emergency) {
             emergency_active = true;
             warn!(sensor = %sensor_name, temp = t, "emergency temperature; forcing 100% pwm");
-            write_pwm(backend, shared, EMERGENCY_PWM, failure_limit).await;
+            write_pwm(
+                backend,
+                shared,
+                EMERGENCY_PWM,
+                failure_limit,
+                params.pwm_scope,
+            )
+            .await;
             let mut s = shared.write().await;
             s.state = DaemonState::Failsafe;
             s.last_error = Some(format!("emergency: {sensor_name} {t:.1}C"));
@@ -653,7 +659,15 @@ async fn control_loop<B: FanControlBackend>(
             } else {
                 "fan at 0 RPM"
             };
-            run_fail_action(backend, shared, fail_action, reason, failure_limit).await;
+            run_fail_action(
+                backend,
+                shared,
+                fail_action,
+                reason,
+                failure_limit,
+                params.pwm_scope,
+            )
+            .await;
             continue;
         }
 
@@ -690,7 +704,7 @@ async fn control_loop<B: FanControlBackend>(
                 // REASSERT_TICKS ごとに再送する。
                 ticks_since_write += 1;
                 if applied_pwm != Some(p) || ticks_since_write >= REASSERT_TICKS {
-                    write_pwm(backend, shared, p, failure_limit).await;
+                    write_pwm(backend, shared, p, failure_limit, params.pwm_scope).await;
                     ticks_since_write = 0;
                 }
             }
@@ -745,14 +759,22 @@ async fn control_loop<B: FanControlBackend>(
                         shared.write().await.curve_sensors_missing = false;
                         match limiter.next(target) {
                             Some(p) => {
-                                write_pwm(backend, shared, p, failure_limit).await;
+                                write_pwm(backend, shared, p, failure_limit, params.pwm_scope)
+                                    .await;
                                 ticks_since_write = 0;
                             }
                             None => {
                                 ticks_since_write += 1;
                                 if ticks_since_write >= REASSERT_TICKS {
                                     if let Some(p) = limiter.current() {
-                                        write_pwm(backend, shared, p, failure_limit).await;
+                                        write_pwm(
+                                            backend,
+                                            shared,
+                                            p,
+                                            failure_limit,
+                                            params.pwm_scope,
+                                        )
+                                        .await;
                                     }
                                     ticks_since_write = 0;
                                 }
@@ -778,6 +800,7 @@ async fn run_fail_action<B: FanControlBackend>(
     action: FailAction,
     reason: &str,
     failure_limit: u32,
+    scope: PwmScope,
 ) {
     match action {
         FailAction::IrmcAuto => {
@@ -811,7 +834,7 @@ async fn run_fail_action<B: FanControlBackend>(
         }
         FailAction::FullSpeed => {
             warn!(reason, "fail action: forcing 100% pwm");
-            write_pwm(backend, shared, EMERGENCY_PWM, failure_limit).await;
+            write_pwm(backend, shared, EMERGENCY_PWM, failure_limit, scope).await;
             let mut s = shared.write().await;
             if s.last_error.is_none() {
                 s.last_error = Some(format!("failsafe: {reason}"));
@@ -847,8 +870,9 @@ async fn write_pwm<B: FanControlBackend>(
     shared: &RwLock<Shared>,
     pwm: u8,
     failure_limit: u32,
+    scope: PwmScope,
 ) {
-    match backend.set_global_pwm(pwm).await {
+    match backend.set_pwm(scope, pwm).await {
         Ok(()) => {
             let mut s = shared.write().await;
             s.pwm = Some(pwm);
@@ -945,7 +969,9 @@ pub async fn apply_mode<B: FanControlBackend>(
                     params.max_pwm
                 ));
             }
-            let floor = params.min_pwm.max(fujitsu::MIN_SAFE_PWM);
+            // 下限は config の min_pwm が権威（30 未満も設定可能。
+            // 実機では低 duty でもシャーシファンは回転継続を確認済み）
+            let floor = params.min_pwm;
             if *p < floor {
                 return Err(format!("pwm {p}% is below the allowed floor {floor}%"));
             }
@@ -1131,6 +1157,8 @@ mod tests {
     struct MockBackend {
         model: String,
         pwm: Mutex<Option<u8>>,
+        /// 最後に書かれたスコープ（clear で None に戻る）
+        scope: Mutex<Option<PwmScope>>,
         clear_calls: AtomicUsize,
         fail_clear: AtomicBool,
         fail_write: AtomicBool,
@@ -1143,6 +1171,7 @@ mod tests {
             Self {
                 model: "PRIMERGY TX1320 M4".into(),
                 pwm: Mutex::new(None),
+                scope: Mutex::new(None),
                 clear_calls: AtomicUsize::new(0),
                 fail_clear: AtomicBool::new(false),
                 fail_write: AtomicBool::new(false),
@@ -1164,14 +1193,16 @@ mod tests {
         ) -> impl std::future::Future<Output = IpmiResult<Vec<TempReading>>> + Send {
             async move { Ok(self.temps.clone()) }
         }
-        fn set_global_pwm(
+        fn set_pwm(
             &self,
+            scope: PwmScope,
             pwm: u8,
         ) -> impl std::future::Future<Output = IpmiResult<()>> + Send {
             async move {
                 if self.fail_write.load(Ordering::SeqCst) {
                     return Err(IpmiError::Parse("mock write failure".into()));
                 }
+                *self.scope.lock().await = Some(scope);
                 *self.pwm.lock().await = Some(pwm);
                 Ok(())
             }
@@ -1183,6 +1214,7 @@ mod tests {
                     return Err(IpmiError::Parse("mock clear failure".into()));
                 }
                 *self.pwm.lock().await = None;
+                *self.scope.lock().await = None;
                 Ok(())
             }
         }
@@ -1198,6 +1230,7 @@ mod tests {
         ControlParams {
             min_pwm: 30,
             max_pwm: 100,
+            pwm_scope: PwmScope::All,
             step_up: 20,
             step_down: 5,
             down_hysteresis: 5,
@@ -1275,7 +1308,8 @@ mod tests {
         let b = MockBackend::new();
         let s = shared_with_mode(Mode::FixedPwm(40));
         s.write().await.clear_pending = true;
-        write_pwm(&b, &s, 40, 3).await;
+        write_pwm(&b, &s, 40, 3, PwmScope::Chassis).await;
+        assert_eq!(*b.scope.lock().await, Some(PwmScope::Chassis));
         let s = s.read().await;
         assert_eq!(s.pwm, Some(40));
         assert!(!s.clear_pending);

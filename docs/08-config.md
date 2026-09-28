@@ -95,7 +95,8 @@ max_pwm = 100
 |---|---|
 | `mode` | 起動時モード: `auto`(=`irmc_auto`) / `fixed_pwm` / `curve` / `target_rpm`（未実装・起動時拒否） |
 | `fixed_pwm` | `mode = "fixed_pwm"` のときの PWM 値（必須） |
-| `min_pwm` / `max_pwm` | PWM 許可範囲。min 未満は UI でも拒否 |
+| `pwm_scope` | 強制 PWM の適用範囲。`all`（既定・全ファン）または `chassis`（FAN CPU/FANx SYS のみ強制し、PSU は iRMC 自動制御に残す）。PSU ファンは単独では強制できない（ファームウェア仕様） |
+| `min_pwm` / `max_pwm` | PWM 許可範囲。min 未満は UI でも拒否。既定の下限は 30% だが config で 30 未満も設定可（警告が出る。実機では 0% でもシャーシファンはハードウェアフロアで回転継続する） |
 | `step_up` / `step_down` | 1回の適用での PWM 変化上限 |
 | `down_hysteresis` | 降圧方向のヒステリシス |
 | `min_apply_interval_ms` | PWM 適用の最小間隔 |

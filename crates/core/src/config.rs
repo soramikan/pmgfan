@@ -63,6 +63,8 @@ pub struct ControlConfig {
     pub fixed_pwm: Option<u8>,
     pub min_pwm: u8,
     pub max_pwm: u8,
+    /// 強制 PWM の適用範囲: "all"（全ファン）| "chassis"（PSU は Auto のまま）
+    pub pwm_scope: String,
     pub step_up: u8,
     pub step_down: u8,
     pub down_hysteresis: u8,
@@ -76,6 +78,7 @@ impl Default for ControlConfig {
             fixed_pwm: None,
             min_pwm: 30,
             max_pwm: 100,
+            pwm_scope: "all".into(),
             step_up: 20,
             step_down: 5,
             down_hysteresis: 5,

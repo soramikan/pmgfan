@@ -221,7 +221,11 @@ max_pwm = 100
 
 ## 制約: ファン個別制御はしない
 
-実証済みなのは `0xff`（全 PWM チャンネル）への強制値設定のみ。
+個別ファン（スロット単位）の強制はファームウェアが受理しない
+（実機観測は [02-ipmi-backend.md](02-ipmi-backend.md) 参照）。
+`W` コマンドのスコープは **`0xff`（全ファン）と
+`0x03`（シャーシファンのみ）だけ**が有効。
+
 v1 では:
 
 ```text
@@ -235,13 +239,16 @@ FAN1 SYS = 1500 RPM
 reference_fan = FAN CPU
 target = 2500 RPM
        ↓
-PWM global = 43%
+PWM (scope) = 43%
        ↓
 FAN CPU  → 約2500 RPM
 FAN1 SYS → そのPWMに対応するRPM
+FAN PSU* → pwm_scope="chassis" なら iRMC 自動制御
 ```
 
-となる。**PSU ファンは監視専用**で制御対象から除外する。
+となる。**PSU ファンは監視専用**で、強制の対象から
+`pwm_scope = "chassis"` で外せる（Auto 相当に留まる）。
+シャーシファン間の比率も変えられない点は同じ。
 
 将来、PWM slot と物理ファンの対応が実機で確定した段階で
 `set_pwm(channel, pwm)` を追加できるよう、backend trait は

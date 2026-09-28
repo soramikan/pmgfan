@@ -2,6 +2,7 @@
 
 use std::io;
 
+use pmgfan_core::control::PwmScope;
 use pmgfan_core::fan::FanReading;
 use pmgfan_core::sensor::TempReading;
 use thiserror::Error;
@@ -53,8 +54,13 @@ pub trait FanControlBackend {
     /// 温度 SDR を読む。
     fn temperatures(&self) -> impl std::future::Future<Output = Result<Vec<TempReading>>> + Send;
 
-    /// 全 PWM チャンネル（0xff）に強制 PWM（%）を設定する。
-    fn set_global_pwm(&self, pwm: u8) -> impl std::future::Future<Output = Result<()>> + Send;
+    /// 強制 PWM（%）を `scope` の範囲に設定する。
+    /// `PwmScope::Chassis` では PSU ファンは iRMC 自動制御に残る。
+    fn set_pwm(
+        &self,
+        scope: PwmScope,
+        pwm: u8,
+    ) -> impl std::future::Future<Output = Result<()>> + Send;
 
     /// PWM 強制を解除し、iRMC 自動制御へ戻す。
     fn clear_override(&self) -> impl std::future::Future<Output = Result<()>> + Send;

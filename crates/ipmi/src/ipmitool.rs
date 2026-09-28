@@ -12,6 +12,7 @@ use tokio::process::Command;
 
 use crate::backend::{FanControlBackend, IpmiError, PwmSlot, Result};
 use crate::fujitsu;
+use pmgfan_core::control::PwmScope;
 
 /// 1回の ipmitool 呼び出しの上限。これを超えると子プロセスを kill して
 /// エラーにする（デーモン側で無制限に待機しないための保証）。
@@ -133,12 +134,20 @@ impl FanControlBackend for IpmitoolBackend {
         }
     }
 
-    fn set_global_pwm(&self, pwm: u8) -> impl std::future::Future<Output = Result<()>> + Send {
+    fn set_pwm(
+        &self,
+        scope: PwmScope,
+        pwm: u8,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
         async move {
             if pwm > fujitsu::MAX_PWM {
                 return Err(IpmiError::Parse(format!("pwm must be 0..=100, got {pwm}")));
             }
-            self.raw(&fujitsu::set_global_pwm_data(pwm)).await?;
+            let scope = match scope {
+                PwmScope::All => fujitsu::SCOPE_ALL,
+                PwmScope::Chassis => fujitsu::SCOPE_CHASSIS,
+            };
+            self.raw(&fujitsu::set_pwm_data(scope, pwm)).await?;
             Ok(())
         }
     }

@@ -74,7 +74,8 @@ daemon shutdown
   ハングした子プロセスがループを塞がないようにする
 - **不正設定**: `mode = "curve"` で `[[curve]]` 未定義、
   `mode = "fixed_pwm"` で `fixed_pwm` 未指定/範囲外、
-  `min_pwm < 30` や `min > max`、昇順でないカーブ点、
+  `min > max`、昇順でないカーブ点、
+  未対応の `pwm_scope`/`fail_action`/`backend`、
   空の `device.model`、非有限・範囲外の緊急温度などは
   起動時にエラー終了
 

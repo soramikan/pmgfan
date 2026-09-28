@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use pmgfan_core::config::Config;
-use pmgfan_core::control::ControlParams;
+use pmgfan_core::control::{ControlParams, PwmScope};
 use pmgfan_core::curve::Curve;
 use pmgfan_core::fan::FanReading;
 use pmgfan_core::hwmon;
@@ -66,13 +66,17 @@ enum Cmd {
         #[arg(short = 'n', long, default_value_t = 2.0)]
         interval: f64,
     },
-    /// 全 PWM チャンネルを % 固定する
+    /// PWM を % 固定する（既定は全ファン。--chassis で PSU を除く）
     SetPwm {
         /// PWM duty (%)
         percent: u8,
         /// 30% 未満を許可する
         #[arg(long)]
         allow_low: bool,
+        /// シャーシファン（FAN CPU / FANx SYS）のみに適用し、
+        /// PSU ファンは iRMC 自動制御に残す
+        #[arg(long)]
+        chassis: bool,
     },
     /// PWM force スロットを読み出す
     Read {
@@ -124,7 +128,11 @@ async fn main() -> Result<()> {
                     Ok(())
                 }
                 Cmd::Monitor { interval } => monitor(&backend, interval).await,
-                Cmd::SetPwm { percent, allow_low } => {
+                Cmd::SetPwm {
+                    percent,
+                    allow_low,
+                    chassis,
+                } => {
                     if percent > fujitsu::MAX_PWM {
                         bail!("percent must be 0..=100, got {percent}");
                     }
@@ -134,8 +142,16 @@ async fn main() -> Result<()> {
                             fujitsu::MIN_SAFE_PWM
                         );
                     }
-                    backend.set_global_pwm(percent).await?;
-                    println!("set all PWM channels to {percent}%");
+                    let scope = if chassis {
+                        PwmScope::Chassis
+                    } else {
+                        PwmScope::All
+                    };
+                    backend.set_pwm(scope, percent).await?;
+                    println!(
+                        "set {} PWM channels to {percent}%",
+                        if chassis { "chassis" } else { "all" }
+                    );
                     print_fans(&backend.fans().await?);
                     Ok(())
                 }
@@ -206,23 +222,27 @@ fn build_params(config_path: Option<&Path>, socket: PathBuf) -> Result<(daemon::
         .context("invalid curve in config")?;
 
     let cc = &config.control;
-    // PWM 範囲・ステップの不変条件。config 経由でも安全下限を割らせない
-    if cc.min_pwm < fujitsu::MIN_SAFE_PWM {
+    // PWM 範囲・ステップの不変条件。min_pwm の既定は 30% だが
+    // 実機ではそれ以下でもファンは回転継続するため、config で
+    // 明示した値はそのまま下限として使う（下限を下げると
+    // 冷却余力が減るので警告は出す）
+    if cc.min_pwm > cc.max_pwm || cc.max_pwm > fujitsu::MAX_PWM {
         bail!(
-            "[control] min_pwm {} is below the safety floor {}%",
+            "[control] invalid pwm range min={} max={} (need 0..={})",
+            cc.min_pwm,
+            cc.max_pwm,
+            fujitsu::MAX_PWM
+        );
+    }
+    if cc.min_pwm < fujitsu::MIN_SAFE_PWM {
+        eprintln!(
+            "warning: [control] min_pwm {}% is below the default safety floor {}%",
             cc.min_pwm,
             fujitsu::MIN_SAFE_PWM
         );
     }
-    if cc.min_pwm > cc.max_pwm || cc.max_pwm > fujitsu::MAX_PWM {
-        bail!(
-            "[control] invalid pwm range min={} max={} (need {}..={})",
-            cc.min_pwm,
-            cc.max_pwm,
-            fujitsu::MIN_SAFE_PWM,
-            fujitsu::MAX_PWM
-        );
-    }
+    // 強制 PWM の適用範囲。"chassis" で PSU ファンを iRMC 自動制御に残す
+    let pwm_scope = PwmScope::parse(&cc.pwm_scope).map_err(anyhow::Error::msg)?;
     if cc.step_up == 0 || cc.step_down == 0 {
         bail!("[control] step_up/step_down must be >= 1");
     }
@@ -293,6 +313,7 @@ fn build_params(config_path: Option<&Path>, socket: PathBuf) -> Result<(daemon::
         control: ControlParams {
             min_pwm: cc.min_pwm,
             max_pwm: cc.max_pwm,
+            pwm_scope,
             step_up: cc.step_up,
             step_down: cc.step_down,
             down_hysteresis: cc.down_hysteresis,

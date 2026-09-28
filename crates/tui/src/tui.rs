@@ -96,6 +96,8 @@ struct App {
     /// Fixed PWM ダイアログの下限/上限（config の control.* 由来）。
     pwm_min: u8,
     pwm_max: u8,
+    /// config の control.pwm_scope（ヘッダー表示用）
+    pwm_scope: String,
     status: Option<Status>,
     conn_error: Option<String>,
     /// `chip/label` → 温度履歴
@@ -121,6 +123,7 @@ impl App {
         curves: Vec<Curve>,
         pwm_min: u8,
         pwm_max: u8,
+        pwm_scope: String,
         tx: mpsc::UnboundedSender<Outcome>,
         rx: mpsc::UnboundedReceiver<Outcome>,
     ) -> Self {
@@ -129,6 +132,7 @@ impl App {
             curves,
             pwm_min,
             pwm_max,
+            pwm_scope,
             status: None,
             conn_error: None,
             temp_history: HashMap::new(),
@@ -397,6 +401,7 @@ pub async fn run(socket: &Path, config_path: Option<&Path>) -> Result<()> {
         cfg.curves,
         cfg.pwm_min,
         cfg.pwm_max,
+        cfg.pwm_scope,
         tx,
         rx,
     );
@@ -450,6 +455,8 @@ struct TuiConfig {
     curves: Vec<Curve>,
     pwm_min: u8,
     pwm_max: u8,
+    /// 強制 PWM の適用範囲（"all"/"chassis"）
+    pwm_scope: String,
     error: Option<String>,
 }
 
@@ -458,6 +465,7 @@ fn load_config(config_path: Option<&Path>) -> TuiConfig {
         curves: Vec::new(),
         pwm_min: DEFAULT_PWM_MIN,
         pwm_max: DEFAULT_PWM_MAX,
+        pwm_scope: "all".into(),
         error: None,
     };
     let Some(path) = config_path else {
@@ -472,8 +480,11 @@ fn load_config(config_path: Option<&Path>) -> TuiConfig {
     };
     match toml::from_str::<Config>(&text) {
         Ok(config) => {
-            cfg.pwm_min = config.control.min_pwm.max(DEFAULT_PWM_MIN);
-            cfg.pwm_max = config.control.max_pwm.min(100).max(cfg.pwm_min);
+            // config の min_pwm をそのまま下限に使う（30 未満も
+            // 設定可能。daemon 側でも同じ値で検証される）
+            cfg.pwm_max = config.control.max_pwm.min(100);
+            cfg.pwm_min = config.control.min_pwm.min(cfg.pwm_max);
+            cfg.pwm_scope = config.control.pwm_scope.clone();
             cfg.curves = config
                 .curves
                 .iter()
@@ -759,6 +770,12 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         Span::styled(state, Style::default().fg(state_color)),
         Span::styled("   PWM: ", Style::default().fg(Color::DarkGray)),
         Span::styled(pwm, Style::default().fg(Color::Yellow)),
+        // chassis スコープ時は PSU が iRMC 自動制御に残ることを表示
+        if app.pwm_scope == "chassis" {
+            Span::styled(" (PSU: auto)", Style::default().fg(Color::DarkGray))
+        } else {
+            Span::raw("")
+        },
         Span::styled("   Up: ", Style::default().fg(Color::DarkGray)),
         Span::raw(uptime),
         conn,
@@ -1193,6 +1210,7 @@ mod tests {
             Vec::new(),
             DEFAULT_PWM_MIN,
             DEFAULT_PWM_MAX,
+            "all".into(),
             tx,
             rx,
         )
@@ -1256,7 +1274,15 @@ mod tests {
     #[test]
     fn dialog_uses_config_bounds() {
         let (tx, rx) = mpsc::unbounded_channel();
-        let mut app = App::new(PathBuf::from("/x.sock"), Vec::new(), 40, 80, tx, rx);
+        let mut app = App::new(
+            PathBuf::from("/x.sock"),
+            Vec::new(),
+            40,
+            80,
+            "all".into(),
+            tx,
+            rx,
+        );
         // seed が範囲外でも開いた時点でクランプされる
         app.status = Some(Status {
             state: DaemonState::Controlling,

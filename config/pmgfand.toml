@@ -15,7 +15,17 @@ history_seconds = 900  # TUI スパークライン用（Phase 6・現在未使�
 [control]
 mode = "curve"
 
-min_pwm = 30
+# 強制 PWM の適用範囲。
+#   "all"     全ファン（PSU 電源ファンを含む）
+#   "chassis" FAN CPU / FANx SYS のみ。PSU ファンは iRMC 自動制御に残る。
+#             PSU は PWM→RPM の特性が急峻で（30% で ~5600RPM）、
+#             Auto では ~1600RPM まで落ちるため、静音目的ならこちら。
+pwm_scope = "chassis"
+
+# 強制 PWM の許可範囲。min を 30 未満に下げられる（実機では
+# 0% でもシャーシファンはハードウェアフロア ~775RPM で回転継続）。
+# 低くしすぎると冷却余力が減る点に注意。
+min_pwm = 10
 max_pwm = 100
 
 step_up = 20

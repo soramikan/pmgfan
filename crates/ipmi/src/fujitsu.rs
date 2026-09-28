@@ -15,8 +15,13 @@ pub const COMMAND: u8 = 0xf5;
 pub const MIN_SAFE_PWM: u8 = 30;
 pub const MAX_PWM: u8 = 100;
 
-/// 全チャンネル指定のスロット番号。
-const SLOT_ALL: u8 = 0xff;
+/// 全チャンネル指定のスコープ値。
+pub const SCOPE_ALL: u8 = 0xff;
+/// シャーシファン（FAN CPU / FANx SYS）のみ指定のスコープ値。
+/// 実機観測: PSU スロットはこのスコープに含まれず、iRMC の
+/// 自動制御に残る。このファームウェアが `W` で受理するのは
+/// 0x03 と 0xff のみ。
+pub const SCOPE_CHASSIS: u8 = 0x03;
 /// 「強制」フラグ。
 const FLAG_FORCE: u8 = 0x80;
 
@@ -29,23 +34,27 @@ fn signature(tag: u8) -> [u8; 4] {
 }
 
 /// `raw` コマンド全体のデータ部（NetFn/Cmd を除く）。
-/// `80 28 00 | 2d 46 57 01 | ff 80 <pwm>`
-pub fn set_global_pwm_data(pwm: u8) -> Vec<u8> {
+/// `80 28 00 | 2d 46 57 01 | <scope> 80 <pwm>`
+/// `scope` は `SCOPE_ALL`（全ファン）または `SCOPE_CHASSIS`
+/// （シャーシファンのみ。PSU は iRMC 自動制御に残る）。
+pub fn set_pwm_data(scope: u8, pwm: u8) -> Vec<u8> {
     debug_assert!(pwm <= MAX_PWM);
+    debug_assert!(scope == SCOPE_ALL || scope == SCOPE_CHASSIS);
     let mut v = Vec::with_capacity(10);
     v.extend_from_slice(&IANA_LE);
     v.extend_from_slice(&signature(b'W'));
-    v.extend_from_slice(&[SLOT_ALL, FLAG_FORCE, pwm]);
+    v.extend_from_slice(&[scope, FLAG_FORCE, pwm]);
     v
 }
 
 /// PWM 強制解除のデータ部。
 /// `80 28 00 | 2d 46 57 01 | ff 00 00`
+/// 解除は常に全スコープ（シャーシ強制の解除にもこれを使う）。
 pub fn clear_override_data() -> Vec<u8> {
     let mut v = Vec::with_capacity(10);
     v.extend_from_slice(&IANA_LE);
     v.extend_from_slice(&signature(b'W'));
-    v.extend_from_slice(&[SLOT_ALL, 0x00, 0x00]);
+    v.extend_from_slice(&[SCOPE_ALL, 0x00, 0x00]);
     v
 }
 
@@ -119,8 +128,13 @@ mod tests {
     #[test]
     fn set_pwm_40_matches_reference_payload() {
         assert_eq!(
-            set_global_pwm_data(40),
+            set_pwm_data(SCOPE_ALL, 40),
             vec![0x80, 0x28, 0x00, 0x2d, 0x46, 0x57, 0x01, 0xff, 0x80, 0x28]
+        );
+        // chassis スコープは先頭バイトだけが変わる
+        assert_eq!(
+            set_pwm_data(SCOPE_CHASSIS, 40),
+            vec![0x80, 0x28, 0x00, 0x2d, 0x46, 0x57, 0x01, 0x03, 0x80, 0x28]
         );
     }
 

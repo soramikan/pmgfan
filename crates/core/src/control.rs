@@ -1,11 +1,42 @@
 //! 制御ループで使うレートリミッタ（ヒステリシス）。
 //! docs/03-control.md の方針: 冷却方向は速く、静音方向はゆっくり。
 
+/// PWM 強制の適用範囲（iRMC `W` コマンドのスコープバイト）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PwmScope {
+    /// 全ファン（PSU を含む）。設定値 `all`
+    All,
+    /// シャーシファン（FAN CPU / FANx SYS）のみ。
+    /// PSU は iRMC 自動制御に残る。設定値 `chassis`
+    Chassis,
+}
+
+impl PwmScope {
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "all" => Ok(Self::All),
+            "chassis" => Ok(Self::Chassis),
+            other => Err(format!(
+                "unknown pwm_scope '{other}' (expected \"all\" or \"chassis\")"
+            )),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Chassis => "chassis",
+        }
+    }
+}
+
 /// レート制限パラメータ。
 #[derive(Debug, Clone, Copy)]
 pub struct ControlParams {
     pub min_pwm: u8,
     pub max_pwm: u8,
+    /// 強制 PWM の適用範囲
+    pub pwm_scope: PwmScope,
     /// 1適用あたりの上昇幅
     pub step_up: u8,
     /// 1適用あたりの下降幅
@@ -20,6 +51,7 @@ impl Default for ControlParams {
         Self {
             min_pwm: 30,
             max_pwm: 100,
+            pwm_scope: PwmScope::All,
             step_up: 20,
             step_down: 5,
             down_hysteresis: 5,
