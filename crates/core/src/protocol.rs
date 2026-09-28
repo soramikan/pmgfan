@@ -11,6 +11,8 @@ use crate::sensor::TempReading;
 
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const DEFAULT_SOCKET_PATH: &str = "/run/pmgfand/control.sock";
+/// キャリブレーション結果の保存先
+pub const DEFAULT_CALIBRATION_PATH: &str = "/var/lib/pmgfand/calibration.toml";
 
 /// デーモンの制御モード。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -24,6 +26,54 @@ pub enum Mode {
     Curve,
     /// RPM フィードバック制御（Phase 7）
     TargetRpm { fan: String, rpm: u32 },
+    /// PWM→RPM 自動計測中（Phase 8。内部用モード — 外部からは
+    /// `start_calibration` リクエストで開始する）
+    Calibrate,
+}
+
+/// キャリブレーション1点分の計測結果。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CalibPoint {
+    pub pwm: u8,
+    /// (ファン名, 中央値 RPM) のペア
+    pub rpm: Vec<(String, u32)>,
+}
+
+/// キャリブレーション進行状態。`status` レスポンスに付随する。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CalibStatus {
+    /// 計測中か
+    pub active: bool,
+    /// 現在書き込み/待機中の PWM レベル
+    pub current_pwm: Option<u8>,
+    /// 完了済みポイント数 / 全ポイント数
+    pub step: usize,
+    pub total: usize,
+    /// 確定済みの計測値
+    pub points: Vec<CalibPoint>,
+    /// 終了結果（成功・エラーの説明。active 中は None）
+    pub result: Option<String>,
+}
+
+/// `calibration.toml` のファイル形式。
+/// serde 実装を daemon 側に持たせないため core で定義する。
+/// ```toml
+/// [[point]]
+/// pwm = 30
+/// [point.rpm]
+/// "FAN CPU" = 2200
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CalibFile {
+    #[serde(default)]
+    pub point: Vec<CalibFilePoint>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CalibFilePoint {
+    pub pwm: u8,
+    #[serde(default)]
+    pub rpm: std::collections::BTreeMap<String, u32>,
 }
 
 /// デーモンの状態機械。
@@ -64,6 +114,9 @@ pub enum Request {
     SetPwmScope {
         scope: PwmScope,
     },
+    /// PWM→RPM キャリブレーションを開始する。
+    /// 中断は任意の `set_mode`（例: auto）で行う。
+    StartCalibration,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -77,6 +130,10 @@ pub enum Response {
         /// 現在の PWM 強制スコープ（ランタイム値が正。
         /// config ファイルではなくデーモンの実状態を返す）
         pwm_scope: PwmScope,
+        /// キャリブレーション状態（実施していなければ None。
+        /// 古いデーモンとの互換のため default）
+        #[serde(default)]
+        calibration: Option<CalibStatus>,
         fans: Vec<FanReading>,
         temperatures: Vec<TempReading>,
         uptime_secs: f64,

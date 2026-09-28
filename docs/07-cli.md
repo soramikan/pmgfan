@@ -12,10 +12,11 @@ pmgfanctl tui             # TUI を明示起動
 pmgfanctl status          # 状態表示
 pmgfanctl auto            # iRMC Auto へ戻す
 pmgfanctl pwm 40          # Fixed PWM 40%
-pmgfanctl rpm "FAN CPU" 2500   # Target RPM（Phase 7）
+pmgfanctl rpm "FAN CPU" 2500   # Target RPM（PI 制御）
 pmgfanctl mode curve      # ファンカーブ制御
 pmgfanctl scope chassis   # PWM 強制をシャーシファンのみに
 pmgfanctl scope all       # PSU を含む全ファンに強制
+pmgfanctl calibrate       # PWM→RPM 自動計測（中断は pmgfanctl auto 等）
 ```
 
 TUI のカーブ表示は `--config <path>` で読んだ `[[curve]]`

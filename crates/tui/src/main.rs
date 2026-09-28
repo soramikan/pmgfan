@@ -45,7 +45,7 @@ enum Cmd {
         /// PWM duty (%)
         percent: u8,
     },
-    /// RPM 目標制御（Phase 7。現状は pmgfand がエラーを返す）
+    /// RPM 目標制御（PI フィードバックで参照ファンを目標 RPM に保つ）
     Rpm {
         /// 基準ファン名（例: "FAN CPU"）
         fan: String,
@@ -63,6 +63,12 @@ enum Cmd {
         /// `all` または `chassis`
         scope: String,
     },
+    /// PWM→RPM キャリブレーションを開始する。
+    /// ファンが min_pwm..100% を順に掃引する（数十秒・音が出る）。
+    /// 中断は任意のモード変更（例: `pmgfanctl auto`）で行う。
+    /// 結果は /var/lib/pmgfand/calibration.toml に保存され、
+    /// Target RPM の初期 PWM 推定に使われる。
+    Calibrate,
 }
 
 // multi_thread が必須: TUI のイベントループは crossterm の
@@ -94,6 +100,7 @@ async fn main() -> Result<()> {
                     mode,
                     pwm,
                     pwm_scope,
+                    calibration,
                     fans,
                     temperatures,
                     uptime_secs,
@@ -102,6 +109,7 @@ async fn main() -> Result<()> {
                     &mode,
                     pwm,
                     pwm_scope,
+                    calibration.as_ref(),
                     &fans,
                     &temperatures,
                     uptime_secs,
@@ -164,14 +172,22 @@ async fn main() -> Result<()> {
             println!("pwm scope -> {}", scope.as_str());
             Ok(())
         }
+        Cmd::Calibrate => {
+            let resp = client::request(&cli.socket, &Request::StartCalibration).await?;
+            client::expect_ok(resp)?;
+            println!("calibration started — watch progress with `pmgfanctl status`");
+            Ok(())
+        }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn print_status(
     state: pmgfan_core::protocol::DaemonState,
     mode: &Mode,
     pwm: Option<u8>,
     pwm_scope: PwmScope,
+    calibration: Option<&pmgfan_core::protocol::CalibStatus>,
     fans: &[pmgfan_core::fan::FanReading],
     temps: &[pmgfan_core::sensor::TempReading],
     uptime_secs: f64,
@@ -181,6 +197,7 @@ fn print_status(
         Mode::FixedPwm(p) => format!("Fixed PWM {p}%"),
         Mode::Curve => "Curve".to_string(),
         Mode::TargetRpm { fan, rpm } => format!("Target {rpm} RPM ({fan})"),
+        Mode::Calibrate => "Calibrating".to_string(),
     };
     println!("Mode: {mode_str}");
     println!("State: {:?}   Uptime: {:.0}s", state, uptime_secs);
@@ -188,6 +205,27 @@ fn print_status(
         println!("PWM: {p}%  (scope: {})", pwm_scope.as_str());
     } else {
         println!("Scope: {}", pwm_scope.as_str());
+    }
+    if let Some(c) = calibration {
+        if c.active {
+            println!(
+                "Calibration: step {}/{} (sweeping {}%)",
+                c.step,
+                c.total,
+                c.current_pwm
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|| "-".into())
+            );
+        } else if let Some(r) = &c.result {
+            println!("Calibration: {r}");
+        }
+        for p in &c.points {
+            let mut s = format!("  pwm={:>3}%", p.pwm);
+            for (name, rpm) in &p.rpm {
+                s.push_str(&format!("  {name}={rpm}"));
+            }
+            println!("{s}");
+        }
     }
     println!();
     for f in fans {

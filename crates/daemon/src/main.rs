@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use pmgfan_core::config::Config;
-use pmgfan_core::control::{ControlParams, PwmScope};
+use pmgfan_core::control::{ControlParams, PiParams, PwmScope};
 use pmgfan_core::curve::Curve;
 use pmgfan_core::fan::FanReading;
 use pmgfan_core::hwmon;
@@ -301,9 +301,53 @@ fn build_params(config_path: Option<&Path>, socket: PathBuf) -> Result<(daemon::
             }
             Mode::Curve
         }
-        "target_rpm" => bail!("mode = \"target_rpm\" is not implemented yet (roadmap phase 7)"),
+        "target_rpm" => {
+            let tr = config
+                .target_rpm
+                .as_ref()
+                .context("mode = \"target_rpm\" requires a [target_rpm] section")?;
+            if tr.reference_fan.trim().is_empty() {
+                bail!("[target_rpm] reference_fan must not be empty");
+            }
+            if !(500..=20000).contains(&tr.target) {
+                bail!(
+                    "[target_rpm] target {} out of sane range 500..=20000",
+                    tr.target
+                );
+            }
+            Mode::TargetRpm {
+                fan: tr.reference_fan.clone(),
+                rpm: tr.target,
+            }
+        }
         other => bail!("unknown [control] mode '{other}'"),
     };
+
+    // PI パラメータ。[target_rpm] が無くても既定値で構築する
+    // （TUI/CLI からの set_mode でも同じ係数を使う）。
+    let tr = config.target_rpm.unwrap_or_default();
+    let pi = {
+        let min = tr.min_pwm.unwrap_or(cc.min_pwm);
+        let max = tr.max_pwm.unwrap_or(cc.max_pwm);
+        if min > max || max > fujitsu::MAX_PWM {
+            bail!("[target_rpm] invalid pwm range min={min} max={max}");
+        }
+        if !tr.kp.is_finite() || tr.kp < 0.0 || !tr.ki.is_finite() || tr.ki < 0.0 {
+            bail!("[target_rpm] kp/ki must be finite and >= 0");
+        }
+        if !tr.deadband.is_finite() || tr.deadband < 0.0 {
+            bail!("[target_rpm] deadband must be finite and >= 0");
+        }
+        PiParams {
+            kp: tr.kp,
+            ki: tr.ki,
+            deadband_rpm: tr.deadband,
+            min_pwm: min,
+            max_pwm: max,
+        }
+    };
+    // キャリブレーション表（無ければ空。PI の初期 PWM 推定に使う）
+    let calibration = daemon::load_calibration(Path::new(protocol::DEFAULT_CALIBRATION_PATH));
 
     let params = daemon::Params {
         socket_path: socket,
@@ -318,6 +362,9 @@ fn build_params(config_path: Option<&Path>, socket: PathBuf) -> Result<(daemon::
             step_down: cc.step_down,
             down_hysteresis: cc.down_hysteresis,
         },
+        pi,
+        calibration,
+        calibration_path: PathBuf::from(protocol::DEFAULT_CALIBRATION_PATH),
         curves,
         startup_mode,
         ipmi_failure_limit: config.safety.ipmi_failure_limit.max(1),

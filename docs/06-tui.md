@@ -5,11 +5,15 @@
 
 実装状況: メイン画面（Mode/State/PWM+スコープ・ファン一覧バー・
 温度+スパークライン履歴・カーブプレビュー）、
-`A`/`C`/`F` キーでのモード切替、Fixed PWM ダイアログ、
+`A`/`C`/`F`/`R` キーでのモード切替（`R` は Target RPM
+ダイアログ: ↑↓ で参照ファン選択、←→ で目標 ±100）、
+Fixed PWM ダイアログ、
 `S` PWM スコープ切替（all ↔ chassis、設定ファイルへ永続化）、
+`X` キャリブレーション開始（進行はヘッダーに `Calib n/m@p%`、
+中断は任意のモード変更キー）、
 `E` カーブエディタ（`S` でデーモン検証+設定ファイル
-永続化+即時適用）は実機動作確認済み。ログビューア・
-Target RPM 画面は未実装（`L`/`R` は告知表示のみ）。
+永続化+即時適用）は実装済み。ログビューアは未実装
+（`L` は告知表示のみ）。
 終了は `Q`/`Esc`/`Ctrl+C`。raw mode では Ctrl+C が
 SIGINT にならないため、Ctrl 修飾付き文字キーはモード
 操作として扱わない（誤操作防止）。ポーリング・モード
@@ -51,7 +55,7 @@ UI は応答し続ける（要求タイムアウト 5s/10s）。
  └─────────────────────────────────────────────────────┘
 
  [A] iRMC Auto  [C] Curve  [F] Fixed PWM  [R] RPM
- [E] Edit curve [S] Scope  [L] Logs   [Q] Quit
+ [E] Edit curve [S] Scope  [X] Calibrate  [L] Logs   [Q] Quit
 ```
 
 `S` キーで PWM スコープを `chassis` ↔ `all` にトグルする。
@@ -113,35 +117,30 @@ Fixed PWM
 
 ## Target RPM（`R`）
 
-```text
-Target RPM
-
- Reference fan:
- > FAN CPU
-
- Target:
-   2500 RPM
-
- Current:
-   2470 RPM
-
- PWM:
-   39%
-
- Error:
-   -30 RPM
-
- Controller:
-   LOCKED
-```
-
-コントローラのステータス:
+実装は簡易ダイアログ（ファン選択 + 目標値入力）:
 
 ```text
-SEARCHING
-STABILIZING
-LOCKED
-LIMITED_MIN
-LIMITED_MAX
-SENSOR_LOST
+┌ Target RPM ──────────────────────┐
+│  reference fan:                  │
+│  > FAN CPU                       │
+│    FAN1 SYS                      │
+│                                  │
+│  target: 2500 RPM                │
+│  ↑↓ fan  ←→ ±100 (Shift ±500)    │
+│  Enter apply  Esc cancel         │
+└──────────────────────────────────┘
 ```
+
+PI 制御自体はデーモン側（`[target_rpm]` の kp/ki/deadband）。
+ヘッダーの Mode には `Target 2500 RPM (FAN CPU)` と出る。
+参照ファンが読めなくなるとデーモンが iRMC Auto へ退避する
+（`Degraded` 表示）。
+
+## キャリブレーション（`X`）
+
+`X` で PWM→RPM 自動計測を開始する（`start_calibration`）。
+計測中はヘッダーに `Calib {step}/{total}@{pwm}%` が出る。
+ファンが `min_pwm`..100% まで順に掃引されるため音が出る。
+中断は `A`/`C`/`F`/`R` など任意のモード変更キーで行う
+（完了時は開始前のモードへ自動復帰し、結果は
+`/var/lib/pmgfand/calibration.toml` へ保存される）。

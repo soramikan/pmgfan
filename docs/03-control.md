@@ -171,7 +171,7 @@ apply tick (min_apply_interval_ms)
 エイリアスに一致しない場合は `chip/label` 形式や
 ラベル名での直接指定も試す。
 
-## Target RPM（回転数指定制御・Phase 7 予定）
+## Target RPM（回転数指定制御・Phase 7 実装済み）
 
 実証済みの OEM コマンドは `set RPM` ではなく `set PWM`。
 そのため目標回転数は閉ループで実現する:
@@ -208,16 +208,24 @@ pwm += Kp × error
 reference_fan = "FAN CPU"
 target = 2500
 
-deadband_rpm = 75
+deadband = 75
 
 kp = 0.003
 ki = 0.0001
 
-min_pwm = 30
+# min_pwm/max_pwm 未指定時は [control] の範囲を使う
+min_pwm = 10
 max_pwm = 100
 ```
 
-`±deadband_rpm` 以内では PWM を変更しない。
+`±deadband` 以内では PWM を変更しない。積分は条件付き
+アンチワインドアップ（出力飽和中は誤差方向への積み増しを
+止める）。モード突入時はキャリブレーション表（あれば）から
+目標 RPM に対応する PWM を逆引きして初期値にする。
+
+参照ファンが読めなくなった場合は他のセンサーフェイルと
+同様に独自制御を捨てて iRMC Auto へ退避し、`Degraded` と
+なる（回復すれば自動で制御へ戻る）。
 
 ## 制約: ファン個別制御はしない
 
@@ -254,43 +262,55 @@ FAN PSU* → pwm_scope="chassis" なら iRMC 自動制御
 `set_pwm(channel, pwm)` を追加できるよう、backend trait は
 `read_override_slots()` を用意している。
 
-## RPM キャリブレーション
+## RPM キャリブレーション（Phase 8 実装済み）
 
-TUI から PWM→RPM 特性を自動計測する:
+`pmgfanctl calibrate` / TUI `X` キーで PWM→RPM 特性を
+自動計測する。デーモン内で `Calibrate` モードへ遷移し、
+`[control] min_pwm` から 100% まで 10% 刻みで掃引する:
 
 ```text
 PWM 30%
 ↓
-10秒待つ
+8秒整定 + 4秒サンプリング
 ↓
 RPM中央値取得
 
-PWM 35%
+PWM 40%
 ↓
-10秒待つ
+8秒整定 + 4秒サンプリング
 ↓
 RPM中央値取得
 
 ...
 ```
 
-結果イメージ:
+- 全ファンの RPM を各レベルで記録する（中央値）。
+- 進行状態は `status` レスポンスの `calibration` フィールド
+  （`active`/`step`/`total`/`current_pwm`/`points`）で公開。
+- 中断は任意のモード変更（`pmgfanctl auto`、TUI の
+  `A`/`C`/`F`/`R`）。途中経過は保存されない。
+- 完了時は結果を保存して開始前のモードへ自動で戻る。
+- 計測中も緊急温度・センサーフェイル等の安全経路は
+  そのまま有効（緊急時は掃引を中断して 100%/fail_action）。
 
-```text
-Calibration
-30%   → 1710 RPM
-35%   → 2050 RPM
-40%   → 2450 RPM
-45%   → 2840 RPM
-50%   → 3220 RPM
-...
-```
-
-保存先:
+保存先（systemd `StateDirectory` で用意）:
 
 ```text
 /var/lib/pmgfand/calibration.toml
 ```
 
+```toml
+[[point]]
+pwm = 30
+[point.rpm]
+"FAN CPU" = 1710
+"FAN1 SYS" = 1450
+```
+
 `Target 2500 RPM` 指定時に最初から約 40% に飛べるため、
 PI 制御の収束が大幅に速くなる。
+
+**注意**: 計測中はファンが最大まで回るため音が出る。
+`pwm_scope = "chassis"` でも PSU ファンは自律制御のため
+掃引の影響を受けず、PSU の特性は計測対象にならない
+（`all` スコープでも PSU は自前のフロアを優先する）。

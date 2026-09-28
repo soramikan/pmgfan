@@ -7,11 +7,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use pmgfan_core::control::{ControlParams, PwmScope, RateLimiter};
+use pmgfan_core::control::{ControlParams, PiController, PiParams, PwmScope, RateLimiter};
 use pmgfan_core::curve::Curve;
 use pmgfan_core::fan::FanReading;
 use pmgfan_core::hwmon;
-use pmgfan_core::protocol::{CurveSpec, DaemonState, Mode};
+use pmgfan_core::protocol::{CalibPoint, CalibStatus, CurveSpec, DaemonState, Mode};
 use pmgfan_core::sensor::{self, TempReading};
 use pmgfan_ipmi::backend::FanControlBackend;
 use tokio::net::UnixDatagram;
@@ -57,6 +57,12 @@ pub struct Params {
     pub temp_interval: Duration,
     pub apply_interval: Duration,
     pub control: ControlParams,
+    /// PI 制御パラメータ（[target_rpm] + [control] min/max から構築）
+    pub pi: PiParams,
+    /// 起動時に読み込んだキャリブレーション表（PI の初期 PWM 推定用）
+    pub calibration: Vec<CalibPoint>,
+    /// キャリブレーション結果の保存先
+    pub calibration_path: PathBuf,
     pub curves: Vec<Curve>,
     pub startup_mode: Mode,
     pub ipmi_failure_limit: u32,
@@ -120,6 +126,14 @@ pub struct Shared {
     /// ControlParams 側は起動時の値で固定のため、制御ループは
     /// 常にこちらを参照する）
     pub pwm_scope: PwmScope,
+    /// TargetRpm モードで参照ファンが解決不能（制御ループが毎 tick
+    /// 更新。Curve 以外のモード時は無視される）
+    pub target_fan_missing: bool,
+    /// キャリブレーション進行状態（StartCalibration で開始、
+    /// モード変更で中断。status レスポンスに含める）
+    pub calibration: Option<CalibStatus>,
+    /// キャリブレーション完了後に戻るモード
+    pub calib_resume_mode: Mode,
     pub started: Instant,
 }
 
@@ -130,6 +144,9 @@ impl Shared {
             mode: startup_mode,
             curves,
             pwm_scope,
+            target_fan_missing: false,
+            calibration: None,
+            calib_resume_mode: Mode::IrmcAuto,
             mode_generation: 0,
             pwm: None,
             fans: Vec::new(),
@@ -172,7 +189,8 @@ fn refresh_state(s: &mut Shared, failure_limit: u32) {
         || s.clear_pending
         || s.sensor_stale
         || s.zero_rpm_detected
-        || (matches!(s.mode, Mode::Curve) && s.curve_sensors_missing);
+        || (matches!(s.mode, Mode::Curve) && s.curve_sensors_missing)
+        || (matches!(s.mode, Mode::TargetRpm { .. }) && s.target_fan_missing);
     s.state = if degraded {
         DaemonState::Degraded
     } else {
@@ -275,6 +293,9 @@ where
         let ctrl = Arc::clone(&ctrl);
         let apply_interval = params.apply_interval;
         let control_params = params.control;
+        let pi_params = params.pi;
+        let calib_table = params.calibration.clone();
+        let calib_path = params.calibration_path.clone();
         let limit = params.ipmi_failure_limit;
         let (cpu_em, pch_em) = (params.cpu_emergency, params.pch_emergency);
         let stale_secs = params.sensor_stale.as_secs();
@@ -286,6 +307,9 @@ where
                 &ctrl,
                 sd_rx,
                 control_params,
+                pi_params,
+                calib_table,
+                calib_path,
                 apply_interval,
                 limit,
                 cpu_em,
@@ -541,6 +565,9 @@ async fn control_loop<B: FanControlBackend>(
     ctrl: &Mutex<()>,
     mut shutdown: watch::Receiver<bool>,
     params: ControlParams,
+    pi_params: PiParams,
+    calib_table: Vec<CalibPoint>,
+    calib_path: PathBuf,
     apply_interval: Duration,
     failure_limit: u32,
     cpu_emergency: f32,
@@ -549,6 +576,8 @@ async fn control_loop<B: FanControlBackend>(
     fail_action: FailAction,
 ) {
     let mut limiter = RateLimiter::new(params);
+    let mut pi = PiController::new(pi_params);
+    let mut calib_job: Option<CalibJob> = None;
     let mut seen_gen = 0u64;
     let mut seen_scope = params.pwm_scope;
     let mut ticks_since_write = 0u32;
@@ -573,18 +602,32 @@ async fn control_loop<B: FanControlBackend>(
         }
         // PWM 操作は apply_mode の即時解除と直列化する
         let _ctrl = ctrl.lock().await;
-        let (mode, gen, temps, curves, applied_pwm, clear_pending, sensor_stale, zero_rpm, scope) = {
+        let (
+            mode,
+            gen,
+            temps,
+            fans,
+            curves,
+            applied_pwm,
+            clear_pending,
+            sensor_stale,
+            zero_rpm,
+            scope,
+            calib_state,
+        ) = {
             let s = shared.read().await;
             (
                 s.mode.clone(),
                 s.mode_generation,
                 s.temps.clone(),
+                s.fans.clone(),
                 s.curves.clone(),
                 s.pwm,
                 s.clear_pending,
                 s.last_temp_ok.elapsed() > Duration::from_secs(sensor_stale_secs),
                 s.zero_rpm_detected,
                 s.pwm_scope,
+                s.calibration.clone(),
             )
         };
         {
@@ -602,8 +645,30 @@ async fn control_loop<B: FanControlBackend>(
             if let Some(p) = applied_pwm {
                 limiter.prime(p);
             }
+            // TargetRpm 突入時は PI を初期化する。キャリブレーション表
+            // があれば目標 RPM から推定 PWM を初期値にして収束を速める。
+            // なければ現在の適用値から滑らかに開始する。
+            if let Mode::TargetRpm { fan, rpm } = &mode {
+                let seed =
+                    estimate_pwm(&calib_table, fan, *rpm).or_else(|| applied_pwm.map(|p| p as f32));
+                match seed {
+                    Some(p) => pi.prime(p),
+                    None => pi.prime(params.min_pwm as f32),
+                }
+            }
             ticks_since_write = 0;
             seen_gen = gen;
+        }
+        // キャリブレーション要求の検出・中断処理:
+        // shared.calibration が立っていれば（mode == Calibrate で）
+        // ジョブを起こす。モードが切り替わったり calibration が
+        // クリアされたらジョブを捨てる（中断）。
+        if mode == Mode::Calibrate && calib_state.as_ref().is_some_and(|c| c.active) {
+            if calib_job.is_none() {
+                calib_job = Some(CalibJob::new(&params));
+            }
+        } else {
+            calib_job = None;
         }
         // スコープ切替時は、強制中の値を新スコープで直ちに書き直す。
         // W コマンドはスコープ外のファンの強制状態を変更しないため、
@@ -838,10 +903,100 @@ async fn control_loop<B: FanControlBackend>(
                     }
                 }
             }
-            Mode::TargetRpm { .. } => {
-                // Phase 7 で実装。set_mode では拒否済みだが
-                // config 直書き等で来た場合の保険。
-                warn!("target_rpm mode is not implemented yet");
+            Mode::TargetRpm { fan, rpm } => {
+                match fan_rpm(&fans, &fan) {
+                    Some(measured) if measured > 0 => {
+                        shared.write().await.target_fan_missing = false;
+                        let p = pi.next(measured as f32, rpm as f32);
+                        ticks_since_write += 1;
+                        if applied_pwm != Some(p) || ticks_since_write >= REASSERT_TICKS {
+                            write_pwm(backend, shared, p, failure_limit, scope).await;
+                            ticks_since_write = 0;
+                        }
+                    }
+                    _ => {
+                        // 参照ファンが読めない → 独自制御を捨てて
+                        // iRMC Auto へ退避（Curve のセンサー全滅と同じ
+                        // フェイルセーフ。制御ループは毎 tick 再評価する）
+                        let needs_clear = {
+                            let s = shared.read().await;
+                            s.pwm.is_some() || s.clear_pending
+                        };
+                        if needs_clear {
+                            warn!(fan = %fan, "target rpm: reference fan not readable; clearing override");
+                            match backend.clear_override().await {
+                                Ok(()) => {
+                                    let mut s = shared.write().await;
+                                    s.pwm = None;
+                                    s.clear_pending = false;
+                                    s.write_failures = 0;
+                                }
+                                Err(e) => {
+                                    let mut s = shared.write().await;
+                                    s.write_failures += 1;
+                                    s.clear_pending = true;
+                                    s.last_error = Some(e.to_string());
+                                    error!(error = %e, "clear_override failed; will retry");
+                                }
+                            }
+                        }
+                        let mut s = shared.write().await;
+                        s.target_fan_missing = true;
+                        s.last_error = Some(format!("reference fan '{fan}' not readable"));
+                        refresh_state(&mut s, failure_limit);
+                    }
+                }
+            }
+            Mode::Calibrate => {
+                match calib_job.as_mut() {
+                    Some(job) => match job.tick(&fans, Instant::now()) {
+                        CalibStep::Write(p) => {
+                            write_pwm(backend, shared, p, failure_limit, scope).await;
+                            ticks_since_write = 0;
+                            shared.write().await.calibration = Some(job.status());
+                        }
+                        CalibStep::Wait => {
+                            shared.write().await.calibration = Some(job.status());
+                        }
+                        CalibStep::Done(points) => {
+                            let saved = persist_calibration(&calib_path, &points);
+                            let mut s = shared.write().await;
+                            match &saved {
+                                Ok(()) => {
+                                    info!(path = %calib_path.display(), "calibration written")
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, "calibration save failed")
+                                }
+                            }
+                            let n = points.len();
+                            s.calibration = Some(CalibStatus {
+                                active: false,
+                                current_pwm: None,
+                                step: n,
+                                total: n,
+                                points,
+                                result: Some(match saved {
+                                    Ok(()) => {
+                                        format!("saved to {}", calib_path.display())
+                                    }
+                                    Err(e) => format!("measured ok; save failed: {e:#}"),
+                                }),
+                            });
+                            // 開始前のモードへ戻す
+                            s.mode = s.calib_resume_mode.clone();
+                            s.mode_generation += 1;
+                            calib_job = None;
+                        }
+                    },
+                    None => {
+                        // calibration 状態なしの Calibrate モード
+                        // （外部直接指定等）→ 安全側の Auto へ退避
+                        let mut s = shared.write().await;
+                        s.mode = Mode::IrmcAuto;
+                        s.mode_generation += 1;
+                    }
+                }
             }
         }
     }
@@ -918,6 +1073,250 @@ fn curve_demand(curves: &[Curve], temps: &[TempReading]) -> (Option<u8>, Vec<Str
         }
     }
     (demand, missing)
+}
+
+/// ファン名から現在 RPM を引く。名前照合は前後空白と
+/// 大文字小文字を緩和する（SDR 名 "FAN CPU" と config /
+/// ユーザー入力の差を吸収）。OK 以外のステータスのファンは
+/// 読み取り不能扱いにする。
+fn fan_rpm(fans: &[FanReading], name: &str) -> Option<u32> {
+    use pmgfan_core::fan::FanStatus;
+    let want = name.trim();
+    let f = fans
+        .iter()
+        .find(|f| f.name.trim().eq_ignore_ascii_case(want) && f.status == FanStatus::Ok)
+        .or_else(|| {
+            fans.iter()
+                .find(|f| f.name.trim().eq_ignore_ascii_case(want))
+        })?;
+    f.rpm.filter(|r| *r > 0)
+}
+
+/// キャリブレーション表から目標 RPM に対応する PWM を線形補間で
+/// 推定する（PI コントローラの初期値シード用）。参照ファンの
+/// 計測列が無い・目標がレンジ外なら端点クランプまたは None。
+fn estimate_pwm(table: &[CalibPoint], fan: &str, target_rpm: u32) -> Option<f32> {
+    let mut pts: Vec<(f32, f32)> = table
+        .iter()
+        .filter_map(|p| {
+            p.rpm
+                .iter()
+                .find(|(n, _)| n.trim().eq_ignore_ascii_case(fan.trim()))
+                .map(|(_, r)| (*r as f32, p.pwm as f32))
+        })
+        .collect();
+    if pts.is_empty() {
+        return None;
+    }
+    pts.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    let t = target_rpm as f32;
+    let first = *pts.first().unwrap();
+    let last = *pts.last().unwrap();
+    if t <= first.0 {
+        return Some(first.1);
+    }
+    if t >= last.0 {
+        return Some(last.1);
+    }
+    for w in pts.windows(2) {
+        let (r0, p0) = w[0];
+        let (r1, p1) = w[1];
+        if t >= r0 && t <= r1 && r1 > r0 {
+            return Some(p0 + (p1 - p0) * (t - r0) / (r1 - r0));
+        }
+    }
+    Some(last.1)
+}
+
+/// キャリブレーションの1レベル整定時間。
+const CALIB_SETTLE: Duration = Duration::from_secs(8);
+/// 1レベルのサンプリング窓。
+const CALIB_SAMPLE: Duration = Duration::from_secs(4);
+/// レベル刻み（`min_pwm` から 100% までこの刻みで掃く）。
+const CALIB_STEP: u8 = 10;
+
+#[derive(Debug, PartialEq)]
+enum CalibPhase {
+    /// PWM 書き換え後の収束待ち
+    Settle,
+    /// RPM サンプル収集中
+    Sample,
+}
+
+/// キャリブレーションジョブ。制御ループが1 tick ずつ
+/// `tick()` を呼んで PWM→RPM 特性を掃引する。
+/// 緊急温度・センサーフェイル等の安全経路は制御ループ側で
+/// 先に処理されるため、ここでは純粋に掃引だけを考える。
+struct CalibJob {
+    levels: Vec<u8>,
+    idx: usize,
+    /// 最初のレベル書き込みを出したか
+    started: bool,
+    phase: CalibPhase,
+    phase_start: Instant,
+    /// 現在レベルで集めた (fan名, rpm 列)
+    samples: Vec<(String, Vec<u32>)>,
+    points: Vec<CalibPoint>,
+}
+
+enum CalibStep {
+    /// この PWM を書き込む
+    Write(u8),
+    /// 何もしない（整定/収集中）
+    Wait,
+    /// 全レベル完了
+    Done(Vec<CalibPoint>),
+}
+
+impl CalibJob {
+    fn new(params: &ControlParams) -> Self {
+        let mut levels: Vec<u8> = (params.min_pwm..=100)
+            .step_by(CALIB_STEP as usize)
+            .collect();
+        if levels.last() != Some(&100) {
+            levels.push(100);
+        }
+        Self {
+            levels,
+            idx: 0,
+            started: false,
+            phase: CalibPhase::Settle,
+            phase_start: Instant::now(),
+            samples: Vec::new(),
+            points: Vec::new(),
+        }
+    }
+
+    fn status(&self) -> CalibStatus {
+        CalibStatus {
+            active: true,
+            current_pwm: Some(self.levels[self.idx]),
+            step: self.points.len(),
+            total: self.levels.len(),
+            points: self.points.clone(),
+            result: None,
+        }
+    }
+
+    fn tick(&mut self, fans: &[FanReading], now: Instant) -> CalibStep {
+        // 最初の呼び出しで min レベルを書き込み、整定フェーズへ。
+        if !self.started {
+            self.started = true;
+            self.phase = CalibPhase::Settle;
+            self.phase_start = now;
+            return CalibStep::Write(self.levels[0]);
+        }
+        match self.phase {
+            CalibPhase::Settle => {
+                if now.duration_since(self.phase_start) >= CALIB_SETTLE {
+                    self.phase = CalibPhase::Sample;
+                    self.phase_start = now;
+                    self.samples.clear();
+                }
+                CalibStep::Wait
+            }
+            CalibPhase::Sample => {
+                for f in fans {
+                    if let Some(rpm) = f.rpm {
+                        if rpm == 0 {
+                            continue;
+                        }
+                        match self.samples.iter_mut().find(|(n, _)| *n == f.name) {
+                            Some((_, v)) => v.push(rpm),
+                            None => self.samples.push((f.name.clone(), vec![rpm])),
+                        }
+                    }
+                }
+                if now.duration_since(self.phase_start) >= CALIB_SAMPLE {
+                    let rpm = self
+                        .samples
+                        .iter()
+                        .map(|(n, v)| (n.clone(), median(v)))
+                        .collect();
+                    self.points.push(CalibPoint {
+                        pwm: self.levels[self.idx],
+                        rpm,
+                    });
+                    self.idx += 1;
+                    if self.idx >= self.levels.len() {
+                        return CalibStep::Done(std::mem::take(&mut self.points));
+                    }
+                    self.phase = CalibPhase::Settle;
+                    self.phase_start = now;
+                    return CalibStep::Write(self.levels[self.idx]);
+                }
+                CalibStep::Wait
+            }
+        }
+    }
+}
+
+/// u32 列の中央値（偶数個なら中央2つの平均）。
+fn median(v: &[u32]) -> u32 {
+    if v.is_empty() {
+        return 0;
+    }
+    let mut v = v.to_vec();
+    v.sort_unstable();
+    let n = v.len();
+    if n % 2 == 1 {
+        v[n / 2]
+    } else {
+        ((v[n / 2 - 1] as u64 + v[n / 2] as u64) / 2) as u32
+    }
+}
+
+/// キャリブレーション結果を TOML で保存する（tmp+rename で原子更新。
+/// 他キーとの混在は無い全生成ファイルなので toml_edit は不要）。
+pub fn persist_calibration(path: &Path, points: &[CalibPoint]) -> Result<()> {
+    use pmgfan_core::protocol::{CalibFile, CalibFilePoint};
+
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
+    }
+    let file = CalibFile {
+        point: points
+            .iter()
+            .map(|p| CalibFilePoint {
+                pwm: p.pwm,
+                rpm: p.rpm.iter().cloned().collect(),
+            })
+            .collect(),
+    };
+    let text = toml::to_string_pretty(&file).context("cannot serialize calibration")?;
+    let tmp = path.with_file_name(format!(
+        ".{}.tmp",
+        path.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "calibration.toml".into())
+    ));
+    std::fs::write(&tmp, text).with_context(|| format!("cannot write {}", tmp.display()))?;
+    std::fs::rename(&tmp, path)
+        .with_context(|| format!("cannot rename {} -> {}", tmp.display(), path.display()))?;
+    Ok(())
+}
+
+/// キャリブレーション結果を読み込む。無い/壊れていれば空。
+pub fn load_calibration(path: &Path) -> Vec<CalibPoint> {
+    use pmgfan_core::protocol::CalibFile;
+
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    match toml::from_str::<CalibFile>(&text) {
+        Ok(f) => f
+            .point
+            .into_iter()
+            .map(|p| CalibPoint {
+                pwm: p.pwm,
+                rpm: p.rpm.into_iter().collect(),
+            })
+            .collect(),
+        Err(e) => {
+            warn!(path = %path.display(), error = %e, "ignoring unreadable calibration file");
+            Vec::new()
+        }
+    }
 }
 
 async fn write_pwm<B: FanControlBackend>(
@@ -1008,6 +1407,7 @@ pub async fn apply_mode<B: FanControlBackend>(
             s.mode_generation += 1;
             s.pwm = None;
             s.clear_pending = false;
+            s.calibration = None;
             s.write_failures = 0;
             // 他ドメインの Degraded/Failsafe を上書きしない
             if s.state != DaemonState::Degraded && s.state != DaemonState::Failsafe {
@@ -1033,6 +1433,7 @@ pub async fn apply_mode<B: FanControlBackend>(
             let mut s = shared.write().await;
             s.mode = mode.clone();
             s.mode_generation += 1;
+            s.calibration = None;
             info!(pwm = p, "mode -> fixed_pwm");
             Ok(())
         }
@@ -1043,10 +1444,49 @@ pub async fn apply_mode<B: FanControlBackend>(
             let mut s = shared.write().await;
             s.mode = Mode::Curve;
             s.mode_generation += 1;
+            s.calibration = None;
             info!("mode -> curve");
             Ok(())
         }
-        Mode::TargetRpm { .. } => Err("mode not implemented yet (roadmap phase 7)".into()),
+        Mode::TargetRpm { fan, rpm } => {
+            if fan.trim().is_empty() {
+                return Err("target_rpm requires a reference fan name".into());
+            }
+            if !(500..=20000).contains(rpm) {
+                return Err(format!("target rpm {rpm} out of sane range 500..=20000"));
+            }
+            // ファン一覧が既知なら参照ファンの存在を検証する。
+            // 起動直後（まだ SDR が読めていない）では受理して
+            // 制御ループの target_fan_missing フェイル経路に任せる。
+            {
+                let s = shared.read().await;
+                let known = !s.fans.is_empty();
+                let found = s
+                    .fans
+                    .iter()
+                    .any(|f| f.name.trim().eq_ignore_ascii_case(fan.trim()));
+                if known && !found {
+                    let names: Vec<_> = s.fans.iter().map(|f| f.name.clone()).collect();
+                    return Err(format!(
+                        "reference fan '{fan}' not found (known: {})",
+                        names.join(", ")
+                    ));
+                }
+            }
+            let mut s = shared.write().await;
+            s.mode = mode.clone();
+            s.mode_generation += 1;
+            s.calibration = None;
+            s.target_fan_missing = false;
+            info!(fan = %fan, rpm = rpm, "mode -> target_rpm");
+            Ok(())
+        }
+        Mode::Calibrate => {
+            // キャリブレーションは StartCalibration リクエスト経由で
+            // 開始する（mode と calibration 状態を同時に立てる必要が
+            // あるため、set_mode 経路では拒否する）
+            Err("calibration is started via the calibrate request, not set_mode".into())
+        }
     }
 }
 
@@ -1312,6 +1752,16 @@ mod tests {
         }
     }
 
+    fn test_pi() -> PiParams {
+        PiParams {
+            kp: 0.003,
+            ki: 0.0001,
+            deadband_rpm: 75.0,
+            min_pwm: 30,
+            max_pwm: 100,
+        }
+    }
+
     fn shared_with_mode(mode: Mode) -> RwLock<Shared> {
         RwLock::new(Shared::new(mode, vec![], PwmScope::All))
     }
@@ -1467,6 +1917,9 @@ mod tests {
                 cc.as_ref(),
                 rx,
                 params(),
+                test_pi(),
+                Vec::new(),
+                std::env::temp_dir().join("pmgfan-test-calib.toml"),
                 Duration::from_millis(10),
                 3,
                 90.0,
@@ -1542,6 +1995,9 @@ mod tests {
                 cc.as_ref(),
                 rx,
                 params(),
+                test_pi(),
+                Vec::new(),
+                std::env::temp_dir().join("pmgfan-test-calib.toml"),
                 Duration::from_millis(10),
                 3,
                 90.0,
@@ -1605,6 +2061,9 @@ mod tests {
                 cc.as_ref(),
                 rx,
                 params(),
+                test_pi(),
+                Vec::new(),
+                std::env::temp_dir().join("pmgfan-test-calib.toml"),
                 Duration::from_millis(10),
                 3,
                 90.0,
@@ -1783,6 +2242,280 @@ mod tests {
             toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(cfg.control.pwm_scope, "all");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Target RPM: 参照ファン未指定・範囲外・未知ファン名は拒否、
+    /// 既知ファンなら受理される。
+    #[tokio::test]
+    async fn apply_mode_target_rpm_validation() {
+        let b = MockBackend::new();
+        let s = shared_with_mode(Mode::IrmcAuto);
+        s.write().await.fans = vec![FanReading {
+            name: "FAN CPU".into(),
+            rpm: Some(2000),
+            status: pmgfan_core::fan::FanStatus::Ok,
+        }];
+        let c = Mutex::new(());
+        let p = params();
+        // 空ファン名 / 範囲外 RPM
+        assert!(apply_mode(
+            &b,
+            &s,
+            &c,
+            &p,
+            &Mode::TargetRpm {
+                fan: " ".into(),
+                rpm: 2500
+            }
+        )
+        .await
+        .is_err());
+        assert!(apply_mode(
+            &b,
+            &s,
+            &c,
+            &p,
+            &Mode::TargetRpm {
+                fan: "FAN CPU".into(),
+                rpm: 100
+            }
+        )
+        .await
+        .is_err());
+        // 一覧が既知なら存在しないファンは拒否
+        assert!(apply_mode(
+            &b,
+            &s,
+            &c,
+            &p,
+            &Mode::TargetRpm {
+                fan: "FAN PSU1".into(),
+                rpm: 2500
+            }
+        )
+        .await
+        .is_err());
+        // 正当な値は受理（ファン名の大小・空白は緩和される）
+        assert!(apply_mode(
+            &b,
+            &s,
+            &c,
+            &p,
+            &Mode::TargetRpm {
+                fan: " fan cpu ".into(),
+                rpm: 2500
+            }
+        )
+        .await
+        .is_ok());
+        let st = s.read().await;
+        assert_eq!(
+            st.mode,
+            Mode::TargetRpm {
+                fan: " fan cpu ".into(),
+                rpm: 2500
+            }
+        );
+    }
+
+    /// Target RPM: ファン一覧が未取得（起動直後）でも受理する —
+    /// 実際の参照可否は制御ループが毎 tick 判定する。
+    #[tokio::test]
+    async fn apply_mode_target_rpm_accepts_unknown_fan_before_first_poll() {
+        let b = MockBackend::new();
+        let s = shared_with_mode(Mode::IrmcAuto);
+        let c = Mutex::new(());
+        assert!(apply_mode(
+            &b,
+            &s,
+            &c,
+            &params(),
+            &Mode::TargetRpm {
+                fan: "ANY".into(),
+                rpm: 2000
+            }
+        )
+        .await
+        .is_ok());
+    }
+
+    /// Target RPM の制御ループ: 実測が目標を下回ると PWM を上げ、
+    /// 参照ファンが消えると解除して Degraded になる。
+    #[tokio::test]
+    async fn target_rpm_controls_and_failsafe_on_missing_fan() {
+        let b = Arc::new(MockBackend::new());
+        let s = Arc::new(RwLock::new(Shared::new(
+            Mode::TargetRpm {
+                fan: "FAN CPU".into(),
+                rpm: 2500,
+            },
+            vec![],
+            PwmScope::All,
+        )));
+        // 制御ループは Shared のファン/温度スナップショットを読む
+        // （ポーリングタスクが書き込む側）。テストでは直接注入する。
+        {
+            let mut w = s.write().await;
+            w.fans = vec![FanReading {
+                name: "FAN CPU".into(),
+                rpm: Some(1800),
+                status: pmgfan_core::fan::FanStatus::Ok,
+            }];
+            w.temps = vec![TempReading {
+                chip: "ipmi".into(),
+                label: "CPU".into(),
+                celsius: 40.0,
+            }];
+        }
+        let c = Arc::new(Mutex::new(()));
+        let (tx, rx) = watch::channel(false);
+        let (bb, ss, cc) = (Arc::clone(&b), Arc::clone(&s), Arc::clone(&c));
+        let task = tokio::spawn(async move {
+            control_loop(
+                bb.as_ref(),
+                ss.as_ref(),
+                cc.as_ref(),
+                rx,
+                params(),
+                test_pi(),
+                Vec::new(),
+                std::env::temp_dir().join("pmgfan-test-calib.toml"),
+                Duration::from_millis(10),
+                3,
+                90.0,
+                95.0,
+                60,
+                FailAction::IrmcAuto,
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        {
+            let st = s.read().await;
+            // 実測 1800 < 目標 2500 → min より上の PWM が書かれる
+            assert!(st.pwm.unwrap_or(0) > 30);
+            assert_eq!(st.state, DaemonState::Controlling);
+            assert!(!st.target_fan_missing);
+        }
+        // 参照ファンが消えた → 解除して Degraded
+        s.write().await.fans.clear();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        {
+            let st = s.read().await;
+            assert!(st.target_fan_missing);
+            assert_eq!(st.pwm, None);
+            assert_eq!(st.state, DaemonState::Degraded);
+        }
+        assert!(b.clear_calls.load(Ordering::SeqCst) >= 1);
+        tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    /// CalibJob: min..=100 を 10 刻みで掃引し、最後に Done で
+    /// 中央値を返す。tick 時刻を注入して時間を圧縮する。
+    #[test]
+    fn calib_job_sweeps_levels_and_returns_medians() {
+        let mut job = CalibJob::new(&params()); // min_pwm=30 → 30..=100 step 10 = 8 levels +100 cap? (30,40,...,100) = 8
+        assert_eq!(job.levels.len(), 8);
+        let fans = || {
+            vec![FanReading {
+                name: "FAN CPU".into(),
+                rpm: Some(2000),
+                status: pmgfan_core::fan::FanStatus::Ok,
+            }]
+        };
+        let mut now = Instant::now();
+        let mut done: Option<Vec<CalibPoint>> = None;
+        for _ in 0..10000 {
+            match job.tick(&fans(), now) {
+                CalibStep::Write(_) => {}
+                CalibStep::Wait => {}
+                CalibStep::Done(pts) => {
+                    done = Some(pts);
+                    break;
+                }
+            }
+            now += Duration::from_secs(5); // settle(8s) 2tick + sample(4s) 1tick で1レベル
+        }
+        let pts = done.expect("job must complete");
+        assert_eq!(pts.len(), 8);
+        assert_eq!(pts[0].pwm, 30);
+        assert_eq!(pts[7].pwm, 100);
+        assert_eq!(pts[0].rpm, vec![("FAN CPU".to_string(), 2000)]);
+    }
+
+    /// キャリブレーション結果の保存→読込の往復。壊れたファイルは
+    /// 空として扱う。
+    #[test]
+    fn calibration_persist_load_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("pmgfan-calib-{}", std::process::id()));
+        let path = dir.join("calibration.toml");
+        let points = vec![
+            CalibPoint {
+                pwm: 30,
+                rpm: vec![("FAN CPU".into(), 1450), ("FAN1 SYS".into(), 1600)],
+            },
+            CalibPoint {
+                pwm: 100,
+                rpm: vec![("FAN CPU".into(), 5200), ("FAN1 SYS".into(), 5400)],
+            },
+        ];
+        persist_calibration(&path, &points).unwrap();
+        let loaded = load_calibration(&path);
+        assert_eq!(loaded, points);
+
+        // 壊れたファイル → 空
+        std::fs::write(&path, "not [toml").unwrap();
+        assert!(load_calibration(&path).is_empty());
+        // 存在しない → 空
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(load_calibration(&path).is_empty());
+    }
+
+    /// estimate_pwm: キャリブレーション表からの線形補間と
+    /// 範囲外クランプ。
+    #[test]
+    fn estimate_pwm_interpolates() {
+        let table = vec![
+            CalibPoint {
+                pwm: 30,
+                rpm: vec![("FAN CPU".into(), 1500)],
+            },
+            CalibPoint {
+                pwm: 50,
+                rpm: vec![("FAN CPU".into(), 2500)],
+            },
+        ];
+        assert_eq!(estimate_pwm(&table, "FAN CPU", 2000), Some(40.0));
+        // 範囲外は端点
+        assert_eq!(estimate_pwm(&table, "FAN CPU", 100), Some(30.0));
+        assert_eq!(estimate_pwm(&table, "FAN CPU", 9999), Some(50.0));
+        // そのファンの列が無ければ None
+        assert_eq!(estimate_pwm(&table, "FAN PSU1", 2000), None);
+    }
+
+    /// apply_mode で任意のモードへ切替すると実行中の
+    /// キャリブレーション状態がクリアされる（中断経路）。
+    #[tokio::test]
+    async fn apply_mode_aborts_calibration() {
+        let b = MockBackend::new();
+        let s = shared_with_mode(Mode::Calibrate);
+        s.write().await.calibration = Some(CalibStatus {
+            active: true,
+            current_pwm: Some(50),
+            step: 2,
+            total: 8,
+            points: vec![],
+            result: None,
+        });
+        let c = Mutex::new(());
+        apply_mode(&b, &s, &c, &params(), &Mode::IrmcAuto)
+            .await
+            .unwrap();
+        assert!(s.read().await.calibration.is_none());
     }
 
     #[test]

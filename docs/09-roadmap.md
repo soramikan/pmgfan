@@ -7,14 +7,14 @@
 | 3 | Fixed PWM / iRMC Auto | ✅ 実機検証済み |
 | 4 | ファンカーブ | ✅ 実機検証済み |
 | 5 | Safety state machine + systemd watchdog | 済み（watchdog/Degraded/緊急温度/センサー陳腐化/0 RPM/fail_action） |
-| 6 | Ratatui TUI | 済み（監視・モード切替・Fixed PWM ダイアログ。カーブエディタは今後） |
-| 7 | Target RPM PI controller | 未着手 |
-| 8 | 自動キャリブレーション | 未着手 |
+| 6 | Ratatui TUI | 済み（監視・モード切替・Fixed/RPM ダイアログ・カーブエディタ・スコープ切替） |
+| 7 | Target RPM PI controller | ✅ 実装済み（PI + デッドバンド + 抗ワインドアップ + 参照ファン喪失で Auto 退避） |
+| 8 | 自動キャリブレーション | ✅ 実装済み（10%刻み掃引・中央値・`/var/lib/pmgfand/calibration.toml`・モード変更で中断・完了後に元モード復帰） |
 | 9 | native `/dev/ipmi0` backend | 未着手 |
 
 **Phase 1〜5 を完成させてから Target RPM を入れる。**
 安全機構なしに閉ループ制御を先に作ると、センサー喪失時に
-暴走するリスクがあるため。
+暴走するリスクがあるため（この順序を守った）。
 
 ## 最終的な構成
 

@@ -144,14 +144,37 @@ where
         .collect())
 }
 
+/// `[target_rpm]` セクション。PI ゲインとデフォルトの目標値。
+/// `min_pwm`/`max_pwm` は未指定なら `[control]` の範囲を使う。
 #[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct TargetRpmConfig {
+    /// 目標 RPM の基準ファン（SDR のファン名。例: "FAN CPU"）
     pub reference_fan: String,
-    pub kp: Option<f64>,
-    pub ki: Option<f64>,
-    pub deadband: Option<u32>,
+    /// `mode = "target_rpm"` で起動した場合の目標 RPM
+    /// （TUI/CLI からの切替では set_mode が値を持つ）
+    pub target: u32,
+    pub kp: f32,
+    pub ki: f32,
+    /// |誤差| がこの RPM 以内なら PWM を変えない
+    pub deadband: f32,
+    /// PI 出力の範囲（未指定なら [control] min/max に従う）
     pub min_pwm: Option<u8>,
     pub max_pwm: Option<u8>,
+}
+
+impl Default for TargetRpmConfig {
+    fn default() -> Self {
+        Self {
+            reference_fan: "FAN CPU".into(),
+            target: 2500,
+            kp: 0.003,
+            ki: 0.0001,
+            deadband: 75.0,
+            min_pwm: None,
+            max_pwm: None,
+        }
+    }
 }
 
 #[cfg(test)]

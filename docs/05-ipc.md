@@ -57,7 +57,21 @@ sudo usermod -aG pmgfan sora
     {"chip":"ipmi","label":"CPU","celsius":36.0},
     {"chip":"coretemp","label":"Package id 0","celsius":37.0}
   ],
+  "calibration": null,
   "uptime_secs": 71.2
+}
+```
+
+`calibration` は計測中/直後のみ値を持つ:
+
+```json
+"calibration": {
+  "active": true,
+  "current_pwm": 50,
+  "step": 3,
+  "total": 10,
+  "points": [{"pwm":30,"rpm":[["FAN CPU",1450]]}],
+  "result": null
 }
 ```
 
@@ -69,7 +83,9 @@ Fixed PWM:
 {"type":"set_mode","mode":{"fixed_pwm":40}}
 ```
 
-Target RPM:
+Target RPM（Phase 7 実装。参照ファン名は既知のファン一覧に
+ある必要がある。一覧未取得の起動直後は受理して制御ループの
+フェイル経路に任せる）:
 
 ```json
 {"type":"set_mode","mode":{"target_rpm":{"fan":"FAN CPU","rpm":2500}}}
@@ -87,9 +103,18 @@ iRMC Auto:
 {"type":"set_mode","mode":"irmc_auto"}
 ```
 
-`target_rpm` は Phase 7 予定のため現在は
-`{"type":"error","error":"mode not implemented yet (roadmap phase 7)"}`
-を返す。
+### キャリブレーション（Phase 8）
+
+```json
+{"type":"start_calibration"}
+```
+
+`Calibrate` モードへ遷移して PWM→RPM 掃引を開始する
+（完了すると開始前のモードへ戻る）。実行中の再要求は
+`"calibration already running"` エラー。中断は任意の
+`set_mode` で行う。`set_mode` で `calibrate` を直接指定
+することはできない（モードと計測状態の同時セットアップが
+必要なため専用リクエスト）。
 
 ### カーブ取得・更新（TUI エディタ用）
 

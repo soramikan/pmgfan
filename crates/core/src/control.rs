@@ -141,6 +141,72 @@ impl RateLimiter {
     }
 }
 
+/// PI 制御パラメータ（`[target_rpm]` セクション由来）。
+#[derive(Debug, Clone, Copy)]
+pub struct PiParams {
+    /// PWM% per RPM 誤差（比例項）
+    pub kp: f32,
+    /// PWM% per RPM·tick 誤差積分（積分項）
+    pub ki: f32,
+    /// |誤差| がこの値以下なら PWM を変えない（振動防止）
+    pub deadband_rpm: f32,
+    pub min_pwm: u8,
+    pub max_pwm: u8,
+}
+
+/// Target RPM 用 PI コントローラ。
+/// `pwm += kp*err + ki*∫err` で、参照ファンの実測 RPM を
+/// 目標値へ追従させる。D 項はファン制御では不要（docs/03）。
+///
+/// アンチワインドアップは条件付き積分: 出力が限界に張り付き、
+/// かつ誤差がさらに同じ方向へ積み増そうとするときだけ
+/// 積分を更新しない（限界から復帰する方向の積分は許可する）。
+#[derive(Debug)]
+pub struct PiController {
+    params: PiParams,
+    /// 内部の連続 PWM 値（端数を蓄積するため float）
+    pwm: f32,
+    /// 誤差積分
+    integral: f32,
+}
+
+impl PiController {
+    pub fn new(params: PiParams) -> Self {
+        Self {
+            params,
+            pwm: params.min_pwm as f32,
+            integral: 0.0,
+        }
+    }
+
+    /// モード開始時の初期 PWM（現在適用値 or キャリブレーション
+    /// 推定値）をシードする。積分はリセットされる。
+    pub fn prime(&mut self, pwm: f32) {
+        self.pwm = pwm.clamp(self.params.min_pwm as f32, self.params.max_pwm as f32);
+        self.integral = 0.0;
+    }
+
+    /// 実測 `measured_rpm` が目標 `target_rpm` に近づくよう
+    /// 次の PWM を返す。deadband 内なら現在値を維持する。
+    pub fn next(&mut self, measured_rpm: f32, target_rpm: f32) -> u8 {
+        let (min, max) = (self.params.min_pwm as f32, self.params.max_pwm as f32);
+        let err = target_rpm - measured_rpm;
+        if err.abs() <= self.params.deadband_rpm {
+            return self.pwm.round().clamp(min, max) as u8;
+        }
+        let candidate = self.pwm + self.params.kp * err + self.params.ki * (self.integral + err);
+        let clamped = candidate.clamp(min, max);
+        // 出力が飽和し、誤差がさらに飽和方向へ向かうときだけ積分しない
+        let saturated_up = candidate > max && err > 0.0;
+        let saturated_down = candidate < min && err < 0.0;
+        if !(saturated_up || saturated_down) {
+            self.integral += err;
+        }
+        self.pwm = clamped;
+        clamped.round() as u8
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,5 +253,72 @@ mod tests {
         assert_eq!(l3.next(20), Some(35)); // target 20 → 30 にクランプ、40-30>=5 で 35 へ
         assert_eq!(l3.next(30), Some(30)); // 下降継続で目標に到達
         assert_eq!(l3.next(30), None);
+    }
+
+    fn pi() -> PiController {
+        PiController::new(PiParams {
+            kp: 0.01, // テストしやすい大きめのゲイン
+            ki: 0.001,
+            deadband_rpm: 50.0,
+            min_pwm: 10,
+            max_pwm: 100,
+        })
+    }
+
+    #[test]
+    fn pi_increases_pwm_when_rpm_below_target() {
+        let mut c = pi();
+        c.prime(40.0);
+        // 目標 2500 に対して実測 2000（誤差 +500）
+        let out = c.next(2000.0, 2500.0);
+        assert!(out > 40, "below target must raise pwm, got {out}");
+        // 反対方向
+        let mut c = pi();
+        c.prime(40.0);
+        let out = c.next(3000.0, 2500.0);
+        assert!(out < 40, "above target must lower pwm, got {out}");
+    }
+
+    #[test]
+    fn pi_deadband_holds_pwm() {
+        let mut c = pi();
+        c.prime(40.0);
+        assert_eq!(c.next(2475.0, 2500.0), 40); // err=25 < deadband 50
+        assert_eq!(c.next(2525.0, 2500.0), 40);
+    }
+
+    #[test]
+    fn pi_converges_and_stops_integrating_at_saturation() {
+        let mut c = pi();
+        c.prime(40.0);
+        // 目標にずっと届かない状況で上限に張り付く。
+        // 初回 tick はまだ立ち上がり途中なので、十分な回数を回して
+        // 飽和したあと「飽和が維持される」ことを確認する
+        for _ in 0..200 {
+            c.next(500.0, 3000.0);
+        }
+        for _ in 0..50 {
+            assert_eq!(c.next(500.0, 3000.0), 100);
+        }
+        // 飽和中に積分が暴れないこと: 復帰方向の誤差ですぐ降り始める
+        let out = c.next(4000.0, 3000.0);
+        assert!(out < 100, "should unwind quickly, got {out}");
+    }
+
+    #[test]
+    fn pi_clamps_output() {
+        let mut c = pi();
+        c.prime(50.0);
+        assert!(c.next(0.0, 20000.0) <= 100);
+        assert!(c.next(20000.0, 500.0) >= 10);
+    }
+
+    #[test]
+    fn pi_prime_clamps_and_resets_integral() {
+        let mut c = pi();
+        c.prime(150.0); // 範囲外 → max にクランプ
+        assert_eq!(c.next(2500.0, 2500.0), 100);
+        c.prime(5.0); // min にクランプ
+        assert_eq!(c.next(2500.0, 2500.0), 10);
     }
 }

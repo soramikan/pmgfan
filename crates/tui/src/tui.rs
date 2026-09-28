@@ -20,7 +20,7 @@ use pmgfan_core::config::Config;
 use pmgfan_core::control::PwmScope;
 use pmgfan_core::curve::Curve;
 use pmgfan_core::fan::FanStatus;
-use pmgfan_core::protocol::{CurveSpec, DaemonState, Mode, Request, Response};
+use pmgfan_core::protocol::{CalibStatus, CurveSpec, DaemonState, Mode, Request, Response};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -62,6 +62,7 @@ struct Status {
     mode: Mode,
     pwm: Option<u8>,
     pwm_scope: PwmScope,
+    calibration: Option<CalibStatus>,
     fans: Vec<pmgfan_core::fan::FanReading>,
     temps: Vec<pmgfan_core::sensor::TempReading>,
     uptime_secs: f64,
@@ -83,6 +84,18 @@ enum Outcome {
         scope: PwmScope,
         result: Result<(), String>,
     },
+    /// キャリブレーション開始（StartCalibration）の結果
+    CalibStarted(Result<(), String>),
+}
+
+/// Target RPM ダイアログの状態。
+struct RpmDialog {
+    /// 選択肢（OK 状態のファン名）
+    fans: Vec<String>,
+    /// 選択中のファン index（↑↓ で切替）
+    idx: usize,
+    /// 目標 RPM
+    rpm: u32,
 }
 
 /// カーブエディタの状態。`curves` は全カーブの編集用コピー。
@@ -111,6 +124,8 @@ struct App {
     /// `chip/label` → 温度履歴
     temp_history: HashMap<String, VecDeque<u64>>,
     pwm_dialog: Option<u8>,
+    /// Target RPM ダイアログ表示中は Some
+    rpm_dialog: Option<RpmDialog>,
     /// カーブエディタ表示中は Some
     editor: Option<CurveEditor>,
     notice: Option<(Instant, String)>,
@@ -145,6 +160,7 @@ impl App {
             conn_error: None,
             temp_history: HashMap::new(),
             pwm_dialog: None,
+            rpm_dialog: None,
             editor: None,
             notice: None,
             quit: false,
@@ -180,6 +196,7 @@ impl App {
                     mode,
                     pwm,
                     pwm_scope,
+                    calibration,
                     fans,
                     temperatures,
                     uptime_secs,
@@ -188,6 +205,7 @@ impl App {
                     mode,
                     pwm,
                     pwm_scope,
+                    calibration,
                     fans,
                     temps: temperatures,
                     uptime_secs,
@@ -313,6 +331,32 @@ impl App {
         });
     }
 
+    /// PWM→RPM キャリブレーションを開始する。
+    /// 計測中はファンが min_pwm..100% を順に掃引して回るため
+    /// 一時的に大きな音が出る。中断は任意のモード変更で行う。
+    fn start_calibration(&mut self) {
+        if self.req_inflight {
+            self.notify("a request is already in flight");
+            return;
+        }
+        self.req_inflight = true;
+        let socket = self.socket.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let r = tokio::time::timeout(
+                REQ_TIMEOUT,
+                client::request(&socket, &Request::StartCalibration),
+            )
+            .await;
+            let result = match r {
+                Ok(Ok(resp)) => client::expect_ok(resp).map_err(|e| format!("{e:#}")),
+                Ok(Err(e)) => Err(format!("{e:#}")),
+                Err(_) => Err("request timeout".into()),
+            };
+            let _ = tx.send(Outcome::CalibStarted(result));
+        });
+    }
+
     /// 要求タスクの結果を状態へ反映する。
     fn apply_outcome(&mut self, outcome: Outcome) {
         match outcome {
@@ -402,6 +446,18 @@ impl App {
                         }
                     }
                     Err(e) => self.notify(format!("scope change failed: {e}")),
+                }
+            }
+            Outcome::CalibStarted(result) => {
+                self.req_inflight = false;
+                match result {
+                    Ok(()) => {
+                        self.notify("calibration started (fans will sweep; press A/C/F/R to stop)");
+                        if !self.poll_inflight {
+                            self.spawn_refresh();
+                        }
+                    }
+                    Err(e) => self.notify(format!("calibration failed to start: {e}")),
                 }
             }
         }
@@ -579,6 +635,10 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
         handle_editor_key(app, code, modifiers);
         return;
     }
+    if app.rpm_dialog.is_some() {
+        handle_rpm_dialog_key(app, code, modifiers);
+        return;
+    }
 
     if let Some(pwm) = app.pwm_dialog {
         let step: i8 = if modifiers.contains(KeyModifiers::SHIFT) {
@@ -616,7 +676,55 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
                     .unwrap_or(40);
                 app.pwm_dialog = Some(clamp_pwm(seed, 0, app.pwm_min, app.pwm_max));
             }
-            'r' => app.notify("target RPM mode is not implemented yet (phase 7)"),
+            'r' => {
+                // OK 状態のファンだけを選択肢にする
+                let fans: Vec<String> = app
+                    .status
+                    .as_ref()
+                    .map(|s| {
+                        s.fans
+                            .iter()
+                            .filter(|f| f.status == FanStatus::Ok && f.rpm.is_some())
+                            .map(|f| f.name.clone())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if fans.is_empty() {
+                    app.notify("no readable fans yet (wait for first poll)");
+                } else {
+                    // 現在 TargetRpm なら同じファン・目標値で開く。
+                    // そうでなければ最初のファンの実測 RPM をシードする。
+                    let (idx, rpm) = match app.status.as_ref().map(|s| &s.mode) {
+                        Some(Mode::TargetRpm { fan, rpm }) => (
+                            fans.iter()
+                                .position(|n| n.trim().eq_ignore_ascii_case(fan.trim()))
+                                .unwrap_or(0),
+                            *rpm,
+                        ),
+                        _ => (
+                            0,
+                            app.status
+                                .as_ref()
+                                .and_then(|s| s.fans.first())
+                                .and_then(|f| f.rpm)
+                                .unwrap_or(2500),
+                        ),
+                    };
+                    app.rpm_dialog = Some(RpmDialog { fans, idx, rpm });
+                }
+            }
+            'x' => {
+                let active = app
+                    .status
+                    .as_ref()
+                    .and_then(|s| s.calibration.as_ref())
+                    .is_some_and(|c| c.active);
+                if active {
+                    app.notify("calibration running — press A/C/F/R to switch mode and abort");
+                } else {
+                    app.start_calibration();
+                }
+            }
             's' => app.toggle_scope(),
             'e' => {
                 if app.curves.is_empty() {
@@ -750,6 +858,40 @@ fn handle_editor_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
     app.editor = Some(ed);
 }
 
+/// Target RPM ダイアログのキー処理。
+/// ↑↓ ファン選択 / ←→ 目標 ±100（Shift ±500）/ Enter 適用 / Esc 取消。
+fn handle_rpm_dialog_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
+    let Some(mut dlg) = app.rpm_dialog.take() else {
+        return;
+    };
+    let step: u32 = if modifiers.contains(KeyModifiers::SHIFT) {
+        500
+    } else {
+        100
+    };
+    match code {
+        KeyCode::Esc => return, // dlg は None のまま = キャンセル
+        KeyCode::Up => dlg.idx = dlg.idx.saturating_sub(1),
+        KeyCode::Down => dlg.idx = (dlg.idx + 1).min(dlg.fans.len().saturating_sub(1)),
+        KeyCode::Left => dlg.rpm = dlg.rpm.saturating_sub(step).max(500),
+        KeyCode::Right => dlg.rpm = (dlg.rpm + step).min(20000),
+        KeyCode::Enter => {
+            let fan = dlg.fans[dlg.idx].clone();
+            let rpm = dlg.rpm;
+            app.set_mode(
+                Mode::TargetRpm {
+                    fan: fan.clone(),
+                    rpm,
+                },
+                &format!("target {rpm} RPM ({fan})"),
+            );
+            return; // dlg は None = 閉じる
+        }
+        _ => {}
+    }
+    app.rpm_dialog = Some(dlg);
+}
+
 fn draw(f: &mut Frame, app: &App) {
     let area = f.area();
     if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
@@ -789,6 +931,9 @@ fn draw(f: &mut Frame, app: &App) {
 
     if let Some(pwm) = app.pwm_dialog {
         draw_pwm_dialog(f, pwm, app.pwm_min, app.pwm_max);
+    }
+    if let Some(dlg) = &app.rpm_dialog {
+        draw_rpm_dialog(f, dlg);
     }
     if let Some(ed) = &app.editor {
         draw_editor(f, ed, app.pwm_min);
@@ -836,6 +981,22 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         match app.pwm_scope {
             PwmScope::Chassis => Span::styled(" [chassis]", Style::default().fg(Color::DarkGray)),
             PwmScope::All => Span::styled(" [all+PSU]", Style::default().fg(Color::Yellow)),
+        },
+        // キャリブレーション進行表示（計測中は黄色、完了直後は緑）
+        match app.status.as_ref().and_then(|s| s.calibration.as_ref()) {
+            Some(c) if c.active => Span::styled(
+                format!(
+                    "  Calib {}/{}@{}%",
+                    c.step,
+                    c.total,
+                    c.current_pwm
+                        .map(|p| p.to_string())
+                        .unwrap_or_else(|| "-".into())
+                ),
+                Style::default().fg(Color::Yellow),
+            ),
+            Some(_) => Span::styled("  Calib: done", Style::default().fg(Color::Green)),
+            None => Span::raw(""),
         },
         Span::styled("   Up: ", Style::default().fg(Color::DarkGray)),
         Span::raw(uptime),
@@ -1056,6 +1217,8 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         Span::raw("dit "),
         Span::styled("[S]", Style::default().fg(Color::Yellow)),
         Span::raw("cope "),
+        Span::styled("[X]", Style::default().fg(Color::Yellow)),
+        Span::raw("calibrate "),
         Span::styled("[L]", Style::default().fg(Color::Yellow)),
         Span::raw("ogs "),
         Span::styled("[Q]", Style::default().fg(Color::Yellow)),
@@ -1223,6 +1386,57 @@ fn draw_editor(f: &mut Frame, ed: &CurveEditor, pwm_min: u8) {
     f.render_widget(canvas, cols[1]);
 }
 
+/// Target RPM ダイアログ。参照ファン選択 + 目標 RPM。
+fn draw_rpm_dialog(f: &mut Frame, dlg: &RpmDialog) {
+    let h = (dlg.fans.len() as u16 + 6).clamp(7, 14);
+    let area = centered_rect(38, h, f.area());
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .title(" Target RPM ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let mut lines: Vec<Line> = vec![Line::from(Span::styled(
+        " reference fan:",
+        Style::default().fg(Color::DarkGray),
+    ))];
+    for (i, name) in dlg.fans.iter().enumerate() {
+        let sel = i == dlg.idx;
+        lines.push(Line::from(vec![
+            Span::styled(
+                if sel { " > " } else { "   " },
+                Style::default().fg(Color::Yellow),
+            ),
+            Span::styled(
+                name.clone(),
+                if sel {
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                },
+            ),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled(" target: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("{} RPM", dlg.rpm),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    lines.push(Line::from(Span::styled(
+        " ↑↓ fan  ←→ ±100 (Shift ±500)  Enter apply  Esc cancel",
+        Style::default().fg(Color::DarkGray),
+    )));
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
 fn centered_rect(w: u16, h: u16, area: Rect) -> Rect {
     let x = area.x + area.width.saturating_sub(w) / 2;
     let y = area.y + area.height.saturating_sub(h) / 2;
@@ -1235,6 +1449,7 @@ fn mode_label(mode: &Mode) -> String {
         Mode::FixedPwm(p) => format!("Fixed PWM {p}%"),
         Mode::Curve => "Curve".into(),
         Mode::TargetRpm { fan, rpm } => format!("Target {rpm} RPM ({fan})"),
+        Mode::Calibrate => "Calibrating".into(),
     }
 }
 
@@ -1352,6 +1567,7 @@ mod tests {
             mode: Mode::FixedPwm(20),
             pwm: Some(20),
             pwm_scope: PwmScope::All,
+            calibration: None,
             fans: vec![],
             temps: vec![],
             uptime_secs: 0.0,

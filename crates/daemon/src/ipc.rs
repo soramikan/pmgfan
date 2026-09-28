@@ -163,6 +163,7 @@ async fn dispatch<B: FanControlBackend>(
                 mode: s.mode.clone(),
                 pwm: s.pwm,
                 pwm_scope: s.pwm_scope,
+                calibration: s.calibration.clone(),
                 fans: s.fans.clone(),
                 temperatures: s.temps.clone(),
                 uptime_secs: s.started.elapsed().as_secs_f64(),
@@ -211,6 +212,30 @@ async fn dispatch<B: FanControlBackend>(
             }
             shared.write().await.pwm_scope = scope;
             info!(scope = scope.as_str(), "pwm scope updated");
+            Response::Ok
+        }
+        Request::StartCalibration => {
+            // mode と calibration を同時に立てて制御ループへ知らせる。
+            // 中断は任意の set_mode で行う（apply_mode が calibration
+            // をクリアし、ループがジョブを捨てる）。
+            let mut s = shared.write().await;
+            if s.calibration.as_ref().is_some_and(|c| c.active) {
+                return Response::Error {
+                    error: "calibration already running".into(),
+                };
+            }
+            s.calib_resume_mode = s.mode.clone();
+            s.calibration = Some(pmgfan_core::protocol::CalibStatus {
+                active: true,
+                current_pwm: None,
+                step: 0,
+                total: 0,
+                points: Vec::new(),
+                result: None,
+            });
+            s.mode = pmgfan_core::protocol::Mode::Calibrate;
+            s.mode_generation += 1;
+            info!("calibration started");
             Response::Ok
         }
     }

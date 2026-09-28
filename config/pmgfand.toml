@@ -66,12 +66,17 @@ points = [
     [90, 100],
 ]
 
+# Target RPM（PI 制御）。`mode = "target_rpm"` の起動値と、
+# TUI/CLI で Target RPM を選んだときに使う PI 係数。
+# 参照ファンが読めなくなると自動で iRMC Auto へ退避する。
 [target_rpm]
 reference_fan = "FAN CPU"
+target = 2500
 
-kp = 0.003
-ki = 0.0001
-deadband = 75
+kp = 0.003      # PWM% per RPM 誤差（比例）
+ki = 0.0001     # PWM% per RPM·tick（積分）
+deadband = 75   # |誤差| がこの RPM 以内なら PWM を変えない
 
-min_pwm = 30
-max_pwm = 100
+# PI 出力の範囲。未指定なら [control] の min_pwm/max_pwm を使う。
+# min_pwm = 10
+# max_pwm = 100

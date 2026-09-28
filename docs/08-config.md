@@ -62,13 +62,15 @@ points = [
 
 [target_rpm]
 reference_fan = "FAN CPU"
+target = 2500
 
 kp = 0.003
 ki = 0.0001
 deadband = 75
 
-min_pwm = 30
-max_pwm = 100
+# min_pwm / max_pwm は未指定なら [control] の範囲を使う
+# min_pwm = 10
+# max_pwm = 100
 ```
 
 ## セクション
@@ -93,7 +95,7 @@ max_pwm = 100
 
 | キー | 説明 |
 |---|---|
-| `mode` | 起動時モード: `auto`(=`irmc_auto`) / `fixed_pwm` / `curve` / `target_rpm`（未実装・起動時拒否） |
+| `mode` | 起動時モード: `auto`(=`irmc_auto`) / `fixed_pwm` / `curve` / `target_rpm`（要 `[target_rpm]`） |
 | `fixed_pwm` | `mode = "fixed_pwm"` のときの PWM 値（必須） |
 | `pwm_scope` | 強制 PWM の適用範囲。`all`（既定・全ファン）または `chassis`（FAN CPU/FANx SYS のみ強制し、PSU は iRMC 自動制御に残す）。PSU ファンは単独では強制できない（ファームウェア仕様） |
 | `min_pwm` / `max_pwm` | PWM 許可範囲。min 未満は UI でも拒否。既定の下限は 30% だが config で 30 未満も設定可（警告が出る。実機では 0% でもシャーシファンはハードウェアフロアで回転継続する） |
@@ -121,7 +123,14 @@ max_pwm = 100
 
 | キー | 説明 |
 |---|---|
-| `reference_fan` | 目標 RPM の基準ファン（例: `FAN CPU`） |
-| `kp` / `ki` | PI ゲイン |
+| `reference_fan` | 目標 RPM の基準ファン（例: `FAN CPU`）。大小・前後空白は緩和して照合 |
+| `target` | `mode = "target_rpm"` 起動時の目標 RPM（500..=20000） |
+| `kp` / `ki` | PI ゲイン（0 以上・有限） |
 | `deadband` | ±RPM 内なら PWM 不変 |
-| `min_pwm` / `max_pwm` | PI 出力の制限 |
+| `min_pwm` / `max_pwm` | PI 出力の制限。省略時は `[control]` の範囲 |
+
+参照ファンが読めなくなるとデーモンは独自制御を捨てて
+iRMC Auto へ退避する（`Degraded`）。モード突入時の初期 PWM は
+`/var/lib/pmgfand/calibration.toml`（`pmgfanctl calibrate` の
+計測結果）からの逆引きを優先し、なければ現在の適用 PWM から
+開始する。

@@ -17,6 +17,9 @@ TimeoutStopSec=10s
 
 RuntimeDirectory=pmgfand
 RuntimeDirectoryMode=0750
+# キャリブレーション結果の保存先 /var/lib/pmgfand を作成する
+# （ProtectSystem=strict 下でも書き込み可能になる）
+StateDirectory=pmgfand
 # ランタイム dir / socket を root:pmgfan にして非 root クライアント
 # （pmgfan グループ）からアクセス可能にする。pmgfan グループが
 # 存在しないと起動に失敗するので先に作成しておく
