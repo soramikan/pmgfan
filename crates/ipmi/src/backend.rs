@@ -51,9 +51,7 @@ pub trait FanControlBackend {
     fn fans(&self) -> impl std::future::Future<Output = Result<Vec<FanReading>>> + Send;
 
     /// 温度 SDR を読む。
-    fn temperatures(
-        &self,
-    ) -> impl std::future::Future<Output = Result<Vec<TempReading>>> + Send;
+    fn temperatures(&self) -> impl std::future::Future<Output = Result<Vec<TempReading>>> + Send;
 
     /// 全 PWM チャンネル（0xff）に強制 PWM（%）を設定する。
     fn set_global_pwm(&self, pwm: u8) -> impl std::future::Future<Output = Result<()>> + Send;

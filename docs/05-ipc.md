@@ -90,6 +90,26 @@ iRMC Auto:
 `{"type":"error","error":"mode not implemented yet (roadmap phase 7)"}`
 を返す。
 
+### カーブ取得・更新（TUI エディタ用）
+
+```json
+{"type":"get_curves"}
+```
+
+→ `{"type":"curves","curves":[{"sensor":"cpu_package","points":[[35,30],...]}]}`
+
+```json
+{"type":"set_curves","curves":[{"sensor":"cpu_package","points":[[35,30],[90,100]]}]}
+```
+
+`set_curves` はデーモン側で検証してから適用する
+（2点以上・温度厳密昇順・PWM は `min_pwm..=max_pwm`・
+温度 0..=150℃・最終点は `max_pwm` 以上 = 高温域で必ず
+全開へ到達する）。`--config` で起動している場合は
+`[[curve]]` セクションを設定ファイルへ書き戻してから
+実行時状態へ適用する（永続化失敗時は適用しない）。
+config 無し起動では実行時適用のみ。
+
 ## 権限モデル
 
 - socket への接続 = 操作権限（読み取りも含めて `pmgfan` グループが必要）

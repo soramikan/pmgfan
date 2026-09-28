@@ -40,7 +40,9 @@ fn read_chip(dir: &Path, chip: &str) -> Vec<TempReading> {
     };
     for entry in entries.flatten() {
         let fname = entry.file_name();
-        let Some(fname) = fname.to_str() else { continue };
+        let Some(fname) = fname.to_str() else {
+            continue;
+        };
         let Some(idx) = temp_input_index(fname) else {
             continue;
         };
@@ -105,12 +107,12 @@ mod tests {
 
         let readings = read_temperatures(&root).unwrap();
         assert_eq!(readings.len(), 2);
-        assert!(readings.iter().any(|t| t.chip == "coretemp"
-            && t.label == "Package id 0"
-            && t.celsius == 41.0));
-        assert!(readings.iter().any(|t| t.chip == "coretemp"
-            && t.label == "temp2_input"
-            && t.celsius == 38.5));
+        assert!(readings
+            .iter()
+            .any(|t| t.chip == "coretemp" && t.label == "Package id 0" && t.celsius == 41.0));
+        assert!(readings
+            .iter()
+            .any(|t| t.chip == "coretemp" && t.label == "temp2_input" && t.celsius == 38.5));
         std::fs::remove_dir_all(&root).ok();
     }
 }

@@ -4,11 +4,10 @@
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use pmgfan_core::control::ControlParams;
-use pmgfan_core::curve::Curve;
 use pmgfan_core::protocol::{decode_request, encode, Request, Response};
 use pmgfan_ipmi::backend::FanControlBackend;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -69,21 +68,22 @@ pub async fn serve<B>(
     listener: UnixListener,
     backend: Arc<B>,
     shared: Arc<RwLock<Shared>>,
-    curves: Arc<Vec<Curve>>,
     ctrl: Arc<Mutex<()>>,
     params: ControlParams,
+    config_path: Option<PathBuf>,
 ) -> std::io::Result<()>
 where
     B: FanControlBackend + Send + Sync + 'static,
 {
+    let config_path = Arc::new(config_path);
     loop {
         let (conn, _) = listener.accept().await?;
         let backend = Arc::clone(&backend);
         let shared = Arc::clone(&shared);
-        let curves = Arc::clone(&curves);
         let ctrl = Arc::clone(&ctrl);
+        let config_path = Arc::clone(&config_path);
         tokio::spawn(async move {
-            if let Err(e) = handle(conn, &*backend, &shared, &curves, &ctrl, &params).await {
+            if let Err(e) = handle(conn, &*backend, &shared, &ctrl, &params, &config_path).await {
                 warn!(error = %e, "ipc connection failed");
             }
         });
@@ -100,7 +100,9 @@ fn set_dir_permissions(dir: &Path) -> std::io::Result<()> {
 
 /// socket のグループを `pmgfan` にする。グループが無ければ警告のみ。
 fn chown_to_group(path: &Path) {
-    let Ok(group) = CString::new(SOCKET_GROUP) else { return };
+    let Ok(group) = CString::new(SOCKET_GROUP) else {
+        return;
+    };
     unsafe {
         let grp = libc::getgrnam(group.as_ptr());
         if grp.is_null() {
@@ -119,15 +121,15 @@ async fn handle<B: FanControlBackend>(
     conn: UnixStream,
     backend: &B,
     shared: &RwLock<Shared>,
-    curves: &[Curve],
     ctrl: &Mutex<()>,
     params: &ControlParams,
+    config_path: &Option<PathBuf>,
 ) -> std::io::Result<()> {
     let (r, mut w) = conn.into_split();
     // 読み取り総量に上限を設け、巨大な1行でメモリを食われないようにする
     let mut lines = BufReader::new(r.take(MAX_REQUEST_BYTES)).lines();
     while let Some(line) = lines.next_line().await? {
-        let resp = dispatch(&line, backend, shared, curves, ctrl, params).await;
+        let resp = dispatch(&line, backend, shared, ctrl, params, config_path).await;
         let mut out = encode(&resp).unwrap_or_else(|_| {
             r#"{"version":1,"type":"error","error":"encode failed"}"#.to_string()
         });
@@ -141,15 +143,17 @@ async fn dispatch<B: FanControlBackend>(
     line: &str,
     backend: &B,
     shared: &RwLock<Shared>,
-    curves: &[Curve],
     ctrl: &Mutex<()>,
     params: &ControlParams,
+    config_path: &Option<PathBuf>,
 ) -> Response {
     let req = match decode_request(line) {
         Ok(r) => r,
-        Err(e) => return Response::Error {
-            error: format!("bad request: {e}"),
-        },
+        Err(e) => {
+            return Response::Error {
+                error: format!("bad request: {e}"),
+            }
+        }
     };
     match req {
         Request::GetStatus => {
@@ -163,10 +167,33 @@ async fn dispatch<B: FanControlBackend>(
                 uptime_secs: s.started.elapsed().as_secs_f64(),
             }
         }
-        Request::SetMode { mode } => {
-            match apply_mode(backend, shared, ctrl, params, curves, &mode).await {
-                Ok(()) => Response::Ok,
+        Request::SetMode { mode } => match apply_mode(backend, shared, ctrl, params, &mode).await {
+            Ok(()) => Response::Ok,
+            Err(e) => Response::Error { error: e },
+        },
+        Request::GetCurves => {
+            let s = shared.read().await;
+            Response::Curves {
+                curves: s.curves.iter().map(crate::daemon::curve_to_spec).collect(),
+            }
+        }
+        Request::SetCurves { curves } => {
+            // 検証 → 設定ファイルへ永続化 → ランタイム適用。
+            // 永続化が失敗した場合は適用しない（再起動後と
+            // 挙動がずれるのを防ぐ）
+            match crate::daemon::validate_curves(&curves, params) {
                 Err(e) => Response::Error { error: e },
+                Ok(validated) => {
+                    if let Some(path) = config_path {
+                        if let Err(e) = crate::daemon::persist_curves(path, &validated) {
+                            return Response::Error {
+                                error: format!("config persist failed (not applied): {e:#}"),
+                            };
+                        }
+                    }
+                    shared.write().await.curves = validated;
+                    Response::Ok
+                }
             }
         }
     }

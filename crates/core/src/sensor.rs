@@ -50,9 +50,7 @@ fn matches(t: &TempReading, key: &str) -> bool {
     let chip = t.chip.to_lowercase();
     let label = t.label.to_lowercase();
     let stripped = label.strip_suffix("_input").unwrap_or(&label);
-    key == label
-        || key == format!("{chip}/{label}")
-        || key == format!("{chip}/{stripped}")
+    key == label || key == format!("{chip}/{label}") || key == format!("{chip}/{stripped}")
 }
 
 #[cfg(test)]
@@ -106,7 +104,9 @@ mod tests {
             52.0
         );
         assert_eq!(
-            resolve(&temps, "pch_cannonlake/temp1_input").unwrap().celsius,
+            resolve(&temps, "pch_cannonlake/temp1_input")
+                .unwrap()
+                .celsius,
             52.0
         );
         assert_eq!(resolve(&temps, "Package id 0").unwrap().celsius, 37.0);

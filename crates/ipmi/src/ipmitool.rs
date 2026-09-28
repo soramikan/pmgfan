@@ -119,9 +119,7 @@ impl FanControlBackend for IpmitoolBackend {
         }
     }
 
-    fn temperatures(
-        &self,
-    ) -> impl std::future::Future<Output = Result<Vec<TempReading>>> + Send {
+    fn temperatures(&self) -> impl std::future::Future<Output = Result<Vec<TempReading>>> + Send {
         async move {
             let out = self
                 .output(&[
@@ -208,9 +206,11 @@ pub fn parse_fans(csv: &str) -> Vec<FanReading> {
         .filter_map(|line| {
             let row = parse_row(line)?;
             let (name, rpm, status) = match row {
-                SdrRow::Compact { name, value, status } => {
-                    (name, value.parse::<u32>().ok(), status)
-                }
+                SdrRow::Compact {
+                    name,
+                    value,
+                    status,
+                } => (name, value.parse::<u32>().ok(), status),
                 SdrRow::Elist {
                     name,
                     status,

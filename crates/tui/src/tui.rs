@@ -19,7 +19,7 @@ use crossterm::terminal::{
 use pmgfan_core::config::Config;
 use pmgfan_core::curve::Curve;
 use pmgfan_core::fan::FanStatus;
-use pmgfan_core::protocol::{DaemonState, Mode, Request, Response};
+use pmgfan_core::protocol::{CurveSpec, DaemonState, Mode, Request, Response};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -68,7 +68,26 @@ struct Status {
 /// バックグラウンド要求タスクからの結果。
 enum Outcome {
     Status(Result<Status, String>),
-    ModeSet { label: String, result: Result<(), String> },
+    ModeSet {
+        label: String,
+        result: Result<(), String>,
+    },
+    /// 起動時・保存後に取得するライブカーブ一覧
+    CurvesFetched(Result<Vec<CurveSpec>, String>),
+    /// カーブ保存（SetCurves）の結果
+    CurvesSaved(Result<(), String>),
+}
+
+/// カーブエディタの状態。`curves` は全カーブの編集用コピー。
+struct CurveEditor {
+    /// (sensor 名, 制御点 (temp, pwm) の列)
+    curves: Vec<(String, Vec<(f32, f32)>)>,
+    /// 編集中のカーブ index（Tab で切替）
+    curve_idx: usize,
+    /// 選択中の制御点 index
+    sel: usize,
+    /// 未保存の変更があるか
+    dirty: bool,
 }
 
 struct App {
@@ -82,6 +101,8 @@ struct App {
     /// `chip/label` → 温度履歴
     temp_history: HashMap<String, VecDeque<u64>>,
     pwm_dialog: Option<u8>,
+    /// カーブエディタ表示中は Some
+    editor: Option<CurveEditor>,
     notice: Option<(Instant, String)>,
     quit: bool,
     tx: mpsc::UnboundedSender<Outcome>,
@@ -112,6 +133,7 @@ impl App {
             conn_error: None,
             temp_history: HashMap::new(),
             pwm_dialog: None,
+            editor: None,
             notice: None,
             quit: false,
             tx,
@@ -137,11 +159,9 @@ impl App {
         let socket = self.socket.clone();
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            let r = tokio::time::timeout(
-                POLL_TIMEOUT,
-                client::request(&socket, &Request::GetStatus),
-            )
-            .await;
+            let r =
+                tokio::time::timeout(POLL_TIMEOUT, client::request(&socket, &Request::GetStatus))
+                    .await;
             let outcome = match r {
                 Ok(Ok(Response::Status {
                     state,
@@ -194,6 +214,62 @@ impl App {
         });
     }
 
+    /// デーモンが現在使用中のカーブ一覧を取得する
+    /// （config ファイルではなくランタイム状態が正）。
+    fn spawn_get_curves(&mut self) {
+        let socket = self.socket.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let r =
+                tokio::time::timeout(REQ_TIMEOUT, client::request(&socket, &Request::GetCurves))
+                    .await;
+            let outcome = match r {
+                Ok(Ok(Response::Curves { curves })) => Outcome::CurvesFetched(Ok(curves)),
+                Ok(Ok(Response::Error { error })) => Outcome::CurvesFetched(Err(error)),
+                Ok(Ok(_)) => Outcome::CurvesFetched(Err("unexpected response".into())),
+                Ok(Err(e)) => Outcome::CurvesFetched(Err(e.to_string())),
+                Err(_) => Outcome::CurvesFetched(Err("request timeout".into())),
+            };
+            let _ = tx.send(outcome);
+        });
+    }
+
+    /// エディタの内容を SetCurves で保存（検証・永続化は
+    /// デーモン側が行う）。保存中は req_inflight を立てる。
+    fn save_curves(&mut self) {
+        let Some(ed) = &self.editor else {
+            return;
+        };
+        if self.req_inflight {
+            self.notify("a request is already in flight");
+            return;
+        }
+        self.req_inflight = true;
+        let specs: Vec<CurveSpec> = ed
+            .curves
+            .iter()
+            .map(|(sensor, points)| CurveSpec {
+                sensor: sensor.clone(),
+                points: points.clone(),
+            })
+            .collect();
+        let socket = self.socket.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let r = tokio::time::timeout(
+                REQ_TIMEOUT,
+                client::request(&socket, &Request::SetCurves { curves: specs }),
+            )
+            .await;
+            let result = match r {
+                Ok(Ok(resp)) => client::expect_ok(resp).map_err(|e| format!("{e:#}")),
+                Ok(Err(e)) => Err(format!("{e:#}")),
+                Err(_) => Err("request timeout".into()),
+            };
+            let _ = tx.send(Outcome::CurvesSaved(result));
+        });
+    }
+
     /// 要求タスクの結果を状態へ反映する。
     fn apply_outcome(&mut self, outcome: Outcome) {
         match outcome {
@@ -202,7 +278,9 @@ impl App {
                 self.conn_error = None;
                 // 消えたセンサーの履歴を捨てる
                 self.temp_history.retain(|k, _| {
-                    s.temps.iter().any(|t| format!("{}/{}", t.chip, t.label) == *k)
+                    s.temps
+                        .iter()
+                        .any(|t| format!("{}/{}", t.chip, t.label) == *k)
                 });
                 for t in &s.temps {
                     if !t.celsius.is_finite() {
@@ -233,6 +311,34 @@ impl App {
                         }
                     }
                     Err(e) => self.notify(e),
+                }
+            }
+            Outcome::CurvesFetched(Ok(specs)) => {
+                // デーモン側のランタイムカーブを表示用の正とする。
+                // 壊れた spec は落とす（daemon は送出前に検証済みの
+                // はずだが、防御的に）。
+                self.curves = specs
+                    .iter()
+                    .filter_map(|s| Curve::new(s.sensor.clone(), s.points.clone()).ok())
+                    .collect();
+            }
+            Outcome::CurvesFetched(Err(e)) => {
+                self.notify(format!("get curves failed: {e}"));
+            }
+            Outcome::CurvesSaved(result) => {
+                self.req_inflight = false;
+                match result {
+                    Ok(()) => {
+                        self.editor = None;
+                        self.notify("curves saved");
+                        self.spawn_get_curves();
+                        if !self.poll_inflight {
+                            self.spawn_refresh();
+                        }
+                    }
+                    // 検証・永続化失敗はエディタを開いたままにして
+                    // 修正し直せるようにする
+                    Err(e) => self.notify(format!("save failed: {e}")),
                 }
             }
         }
@@ -297,6 +403,9 @@ pub async fn run(socket: &Path, config_path: Option<&Path>) -> Result<()> {
     if let Some(e) = cfg.error {
         app.notify(format!("config: {e}"));
     }
+    // ライブカーブをデーモンから取得（config ファイルは
+    // 接続できるまでのフォールバック表示用）
+    app.spawn_get_curves();
 
     // 初回ポーリングはバックグラウンドなので、即座に
     // "connecting" 画面を描画できる（last_poll は
@@ -395,6 +504,11 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
         return;
     }
 
+    if app.editor.is_some() {
+        handle_editor_key(app, code, modifiers);
+        return;
+    }
+
     if let Some(pwm) = app.pwm_dialog {
         let step: i8 = if modifiers.contains(KeyModifiers::SHIFT) {
             5
@@ -402,12 +516,8 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
             1
         };
         match code {
-            KeyCode::Left => {
-                app.pwm_dialog = Some(clamp_pwm(pwm, -step, app.pwm_min, app.pwm_max))
-            }
-            KeyCode::Right => {
-                app.pwm_dialog = Some(clamp_pwm(pwm, step, app.pwm_min, app.pwm_max))
-            }
+            KeyCode::Left => app.pwm_dialog = Some(clamp_pwm(pwm, -step, app.pwm_min, app.pwm_max)),
+            KeyCode::Right => app.pwm_dialog = Some(clamp_pwm(pwm, step, app.pwm_min, app.pwm_max)),
             KeyCode::Enter => {
                 app.pwm_dialog = None;
                 app.set_mode(Mode::FixedPwm(pwm), &format!("fixed PWM {pwm}%"));
@@ -436,12 +546,136 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
                 app.pwm_dialog = Some(clamp_pwm(seed, 0, app.pwm_min, app.pwm_max));
             }
             'r' => app.notify("target RPM mode is not implemented yet (phase 7)"),
-            'e' => app.notify("curve editor is not implemented yet (config: edit pmgfand.toml)"),
+            'e' => {
+                if app.curves.is_empty() {
+                    app.notify("no fan curves configured");
+                } else {
+                    let curves = app
+                        .curves
+                        .iter()
+                        .map(|c| {
+                            (
+                                c.sensor.clone(),
+                                c.points.iter().map(|p| (p.temp, p.pwm)).collect::<Vec<_>>(),
+                            )
+                        })
+                        .collect();
+                    app.editor = Some(CurveEditor {
+                        curves,
+                        curve_idx: 0,
+                        sel: 0,
+                        dirty: false,
+                    });
+                }
+            }
             'l' => app.notify("logs: see `journalctl -u pmgfand`"),
             _ => {}
         },
         _ => {}
     }
+}
+
+/// カーブエディタのキー処理。
+/// ↑↓ 選択 / ←→ PWM ±1（Shift ±5）/ +,- 温度 ±1（Shift ±5）/
+/// A 点追加 / D 点削除 / Tab カーブ切替 / S 保存 / Esc 取消。
+fn handle_editor_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
+    let Some(mut ed) = app.editor.take() else {
+        return;
+    };
+    let step: f32 = if modifiers.contains(KeyModifiers::SHIFT) {
+        5.0
+    } else {
+        1.0
+    };
+    match code {
+        KeyCode::Esc => {
+            // editor は None のまま = 変更破棄
+            return;
+        }
+        KeyCode::Tab | KeyCode::BackTab => {
+            ed.curve_idx = if code == KeyCode::Tab {
+                (ed.curve_idx + 1) % ed.curves.len().max(1)
+            } else {
+                ed.curve_idx.checked_sub(1).unwrap_or(ed.curves.len() - 1)
+            };
+            ed.sel = 0;
+        }
+        KeyCode::Up => ed.sel = ed.sel.saturating_sub(1),
+        KeyCode::Down => {
+            let n = ed.curves[ed.curve_idx].1.len();
+            ed.sel = (ed.sel + 1).min(n.saturating_sub(1));
+        }
+        KeyCode::Left | KeyCode::Right => {
+            let dir = if code == KeyCode::Left { -1.0 } else { 1.0 };
+            let pts = &mut ed.curves[ed.curve_idx].1;
+            let (t, p) = pts[ed.sel];
+            let np = (p + dir * step).clamp(app.pwm_min as f32, app.pwm_max as f32);
+            if np != p {
+                pts[ed.sel] = (t, np);
+                ed.dirty = true;
+            }
+        }
+        KeyCode::Char('-') | KeyCode::Char('_') | KeyCode::Char('+') | KeyCode::Char('=') => {
+            let dir = if matches!(code, KeyCode::Char('-') | KeyCode::Char('_')) {
+                -1.0
+            } else {
+                1.0
+            };
+            let pts = &mut ed.curves[ed.curve_idx].1;
+            let (t, p) = pts[ed.sel];
+            // 厳密昇順を維持するため隣接点の内側にクランプ
+            let lo = if ed.sel > 0 {
+                pts[ed.sel - 1].0 + 1.0
+            } else {
+                0.0
+            };
+            let hi = if ed.sel + 1 < pts.len() {
+                pts[ed.sel + 1].0 - 1.0
+            } else {
+                150.0
+            };
+            let nt = (t + dir * step).clamp(lo.min(hi), hi);
+            if nt != t {
+                pts[ed.sel] = (nt, p);
+                ed.dirty = true;
+            }
+        }
+        KeyCode::Char('a') => {
+            let pts = &mut ed.curves[ed.curve_idx].1;
+            let cur = pts[ed.sel];
+            // 選択点と次点の中間温度に挿入（末尾なら +10℃）
+            let nt = if ed.sel + 1 < pts.len() {
+                (cur.0 + pts[ed.sel + 1].0) / 2.0
+            } else {
+                (cur.0 + 10.0).min(150.0)
+            };
+            // 中点が作れない（隣接と同値以下）なら追加しない
+            if nt > cur.0 && (ed.sel + 1 >= pts.len() || nt < pts[ed.sel + 1].0) {
+                pts.insert(ed.sel + 1, (nt, cur.1));
+                ed.sel += 1;
+                ed.dirty = true;
+            } else {
+                app.notify("no room to insert a point here");
+            }
+        }
+        KeyCode::Char('d') => {
+            let pts = &mut ed.curves[ed.curve_idx].1;
+            if pts.len() > 2 {
+                pts.remove(ed.sel);
+                ed.sel = ed.sel.min(pts.len() - 1);
+                ed.dirty = true;
+            } else {
+                app.notify("a curve needs at least 2 points");
+            }
+        }
+        KeyCode::Char('s') => {
+            app.editor = Some(ed);
+            app.save_curves();
+            return;
+        }
+        _ => {}
+    }
+    app.editor = Some(ed);
 }
 
 fn draw(f: &mut Frame, app: &App) {
@@ -484,6 +718,9 @@ fn draw(f: &mut Frame, app: &App) {
     if let Some(pwm) = app.pwm_dialog {
         draw_pwm_dialog(f, pwm, app.pwm_min, app.pwm_max);
     }
+    if let Some(ed) = &app.editor {
+        draw_editor(f, ed, app.pwm_min);
+    }
 }
 
 fn draw_header(f: &mut Frame, app: &App, area: Rect) {
@@ -491,7 +728,9 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         Some(s) => (
             mode_label(&s.mode),
             format!("{:?}", s.state),
-            s.pwm.map(|p| format!("{p}%")).unwrap_or_else(|| "--".into()),
+            s.pwm
+                .map(|p| format!("{p}%"))
+                .unwrap_or_else(|| "--".into()),
             format!("{}s", s.uptime_secs as u64),
         ),
         None => ("--".into(), "--".into(), "--".into(), "--".into()),
@@ -510,7 +749,12 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     };
     let line = Line::from(vec![
         Span::styled(" Mode: ", Style::default().fg(Color::DarkGray)),
-        Span::styled(mode, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            mode,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled("   State: ", Style::default().fg(Color::DarkGray)),
         Span::styled(state, Style::default().fg(state_color)),
         Span::styled("   PWM: ", Style::default().fg(Color::DarkGray)),
@@ -564,7 +808,10 @@ fn draw_fans(f: &mut Frame, app: &App, area: Rect) {
                 FanStatus::Unknown => Color::Yellow,
             };
             Line::from(vec![
-                Span::styled(format!(" {:<12}", fan.name), Style::default().fg(Color::White)),
+                Span::styled(
+                    format!(" {:<12}", fan.name),
+                    Style::default().fg(Color::White),
+                ),
                 Span::styled(rpm_s, Style::default().fg(Color::Cyan)),
                 Span::raw("  "),
                 Span::styled(bar, Style::default().fg(Color::Blue)),
@@ -587,7 +834,9 @@ fn draw_fans(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_temps(f: &mut Frame, app: &App, area: Rect) {
-    let block = Block::default().title(" Temperatures ").borders(Borders::ALL);
+    let block = Block::default()
+        .title(" Temperatures ")
+        .borders(Borders::ALL);
     let inner = block.inner(area);
     f.render_widget(block, area);
     let Some(status) = &app.status else {
@@ -631,7 +880,10 @@ fn draw_temps(f: &mut Frame, app: &App, area: Rect) {
                     format!(" {:<10}", t.chip),
                     Style::default().fg(Color::DarkGray),
                 ),
-                Span::styled(format!("{:<13}", t.label), Style::default().fg(Color::White)),
+                Span::styled(
+                    format!("{:<13}", t.label),
+                    Style::default().fg(Color::White),
+                ),
             ])),
             cells[0],
         );
@@ -777,6 +1029,120 @@ fn draw_pwm_dialog(f: &mut Frame, pwm: u8, pwm_min: u8, pwm_max: u8) {
     );
 }
 
+/// カーブエディタのモーダル。制御点テーブル + 簡易プレビュー。
+fn draw_editor(f: &mut Frame, ed: &CurveEditor, pwm_min: u8) {
+    let area = f.area();
+    let (sensor, pts) = &ed.curves[ed.curve_idx];
+    let w = 66u16.min(area.width.saturating_sub(4));
+    // タイトル+ヘッダ+点数+空行+2行ヘルプ
+    let want_h = pts.len() as u16 + 8;
+    let h = want_h.clamp(8, area.height.saturating_sub(2));
+    let dlg = centered_rect(w, h, area);
+    f.render_widget(Clear, dlg);
+    let title = format!(
+        " Curve Editor — {sensor} ({}/{}){} ",
+        ed.curve_idx + 1,
+        ed.curves.len(),
+        if ed.dirty { "  [unsaved]" } else { "" }
+    );
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(dlg);
+    f.render_widget(block, dlg);
+    // 左: 制御点テーブル、右: プレビューグラフ
+    let cols = Layout::horizontal([Constraint::Length(24), Constraint::Min(10)]).split(inner);
+    // ヘッダ行 + 点数 + 空行 + ヘルプ2行
+    let table_area = cols[0];
+    let body_rows = (table_area.height as usize).saturating_sub(4);
+    // 選択行が見えるようウィンドウ化
+    let start = ed
+        .sel
+        .saturating_sub(body_rows.saturating_sub(1))
+        .min(pts.len().saturating_sub(body_rows.max(1)));
+    let mut lines: Vec<Line> = vec![Line::from(Span::styled(
+        "     Temp    PWM",
+        Style::default().fg(Color::DarkGray),
+    ))];
+    for (i, (t, p)) in pts.iter().enumerate().skip(start).take(body_rows.max(1)) {
+        let sel = i == ed.sel;
+        let style = if sel {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        let marker = if sel { ">" } else { " " };
+        let bar = "▮".repeat((*p / 10.0) as usize);
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {marker} {t:>5.1}°C  {p:>3.0}% "), style),
+            Span::styled(bar, Style::default().fg(Color::Blue)),
+        ]));
+    }
+    if start + body_rows < pts.len() {
+        lines.push(Line::from(Span::styled(
+            "   …",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        " ↑↓ sel  ←→ pwm  +/- temp",
+        Style::default().fg(Color::DarkGray),
+    )));
+    lines.push(Line::from(Span::styled(
+        " A add  D del  Tab curve  S save  Esc cancel",
+        Style::default().fg(Color::DarkGray),
+    )));
+    f.render_widget(Paragraph::new(lines), table_area);
+
+    // 編集中の点列をそのままプレビュー
+    let (mut lo, mut hi) = (f64::MAX, f64::MIN);
+    for c in &ed.curves {
+        for (t, _) in &c.1 {
+            lo = lo.min(*t as f64);
+            hi = hi.max(*t as f64);
+        }
+    }
+    let lo = (lo - 5.0).clamp(0.0, 140.0);
+    let hi = (hi + 5.0).clamp(lo + 10.0, 160.0);
+    let canvas = Canvas::default()
+        .x_bounds([lo, hi])
+        .y_bounds([pwm_min as f64 - 10.0, 110.0])
+        .paint(|ctx| {
+            for (ci, (_, cpts)) in ed.curves.iter().enumerate() {
+                let color = if ci == ed.curve_idx {
+                    Color::Cyan
+                } else {
+                    Color::DarkGray
+                };
+                for seg in cpts.windows(2) {
+                    ctx.draw(&CanvasLine {
+                        x1: seg[0].0 as f64,
+                        y1: seg[0].1 as f64,
+                        x2: seg[1].0 as f64,
+                        y2: seg[1].1 as f64,
+                        color,
+                    });
+                }
+                for (i, p) in cpts.iter().enumerate() {
+                    let color = if ci == ed.curve_idx && i == ed.sel {
+                        Color::Yellow
+                    } else {
+                        color
+                    };
+                    ctx.draw(&Points {
+                        coords: &[(p.0 as f64, p.1 as f64)],
+                        color,
+                    });
+                }
+            }
+        });
+    f.render_widget(canvas, cols[1]);
+}
+
 fn centered_rect(w: u16, h: u16, area: Rect) -> Rect {
     let x = area.x + area.width.saturating_sub(w) / 2;
     let y = area.y + area.height.saturating_sub(h) / 2;
@@ -890,14 +1256,7 @@ mod tests {
     #[test]
     fn dialog_uses_config_bounds() {
         let (tx, rx) = mpsc::unbounded_channel();
-        let mut app = App::new(
-            PathBuf::from("/x.sock"),
-            Vec::new(),
-            40,
-            80,
-            tx,
-            rx,
-        );
+        let mut app = App::new(PathBuf::from("/x.sock"), Vec::new(), 40, 80, tx, rx);
         // seed が範囲外でも開いた時点でクランプされる
         app.status = Some(Status {
             state: DaemonState::Controlling,
@@ -933,6 +1292,70 @@ mod tests {
         let big = Rect::new(5, 5, 80, 24);
         let r = centered_rect(30, 9, big);
         assert_eq!(r, Rect::new(30, 12, 30, 9));
+    }
+
+    /// エディタ付きの App を作る
+    fn editor_app() -> App {
+        let mut app = test_app();
+        app.curves = vec![Curve::new(
+            "cpu_package",
+            vec![(35.0, 30.0), (60.0, 45.0), (90.0, 100.0)],
+        )
+        .unwrap()];
+        handle_key(&mut app, KeyCode::Char('e'), KeyModifiers::NONE);
+        assert!(app.editor.is_some());
+        app
+    }
+
+    #[test]
+    fn editor_opens_and_cancels() {
+        let mut app = editor_app();
+        let ed = app.editor.as_ref().unwrap();
+        assert_eq!(ed.curves[0].1.len(), 3);
+        assert!(!ed.dirty);
+        handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.editor.is_none());
+    }
+
+    #[test]
+    fn editor_pwm_and_temp_clamps() {
+        let mut app = editor_app();
+        // sel=0 (35℃,30%) → 下限側: 30 未満に下がらない
+        for _ in 0..10 {
+            handle_key(&mut app, KeyCode::Left, KeyModifiers::NONE);
+        }
+        assert_eq!(app.editor.as_ref().unwrap().curves[0].1[0].1, 30.0);
+        // 上限側: 100 超に上がらない
+        for _ in 0..20 {
+            handle_key(&mut app, KeyCode::Right, KeyModifiers::SHIFT);
+        }
+        assert_eq!(app.editor.as_ref().unwrap().curves[0].1[0].1, 100.0);
+        // 温度を上げると次点(60℃)の1つ下まで
+        for _ in 0..30 {
+            handle_key(&mut app, KeyCode::Char('+'), KeyModifiers::SHIFT);
+        }
+        assert_eq!(app.editor.as_ref().unwrap().curves[0].1[0].0, 59.0);
+        assert!(app.editor.as_ref().unwrap().dirty);
+    }
+
+    #[test]
+    fn editor_add_delete_and_min_points() {
+        let mut app = editor_app();
+        // 最終点を選択して A → 中間点追加
+        handle_key(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        handle_key(&mut app, KeyCode::Char('a'), KeyModifiers::NONE);
+        let ed = app.editor.as_ref().unwrap();
+        assert_eq!(ed.curves[0].1.len(), 4);
+        assert_eq!(ed.sel, 3);
+        // 昇順が保たれている
+        let ts: Vec<f32> = ed.curves[0].1.iter().map(|p| p.0).collect();
+        assert!(ts.windows(2).all(|w| w[0] < w[1]));
+        // 2点までしか削除できない
+        for _ in 0..10 {
+            handle_key(&mut app, KeyCode::Char('d'), KeyModifiers::NONE);
+        }
+        assert_eq!(app.editor.as_ref().unwrap().curves[0].1.len(), 2);
     }
 
     #[test]

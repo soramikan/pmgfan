@@ -64,7 +64,9 @@ pub fn read_slots_data(indices: &[u8]) -> Result<Vec<u8>> {
     v.push(indices.len() as u8);
     for &idx in indices {
         if idx > 31 {
-            return Err(IpmiError::Parse(format!("slot index out of range 0..31: {idx}")));
+            return Err(IpmiError::Parse(format!(
+                "slot index out of range 0..31: {idx}"
+            )));
         }
         v.extend_from_slice(&[idx, 0x00]);
     }
@@ -150,7 +152,10 @@ mod tests {
 
     #[test]
     fn parse_hex_bytes_from_raw_output() {
-        assert_eq!(parse_hex_bytes(" 80 28 00 0a ff\n"), vec![0x80, 0x28, 0x00, 0x0a, 0xff]);
+        assert_eq!(
+            parse_hex_bytes(" 80 28 00 0a ff\n"),
+            vec![0x80, 0x28, 0x00, 0x0a, 0xff]
+        );
         assert!(parse_hex_bytes("").is_empty());
         assert_eq!(parse_hex_bytes(" zz 11"), vec![0x11]);
     }
@@ -158,15 +163,33 @@ mod tests {
     #[test]
     fn decode_slots_real_response_auto() {
         // index 0,1,0x19,0x1a の自動制御時の実機応答
-        let resp = [0x80, 0x28, 0x00, 0x01, 0x04, 0x40, 0x59, 0x01, 0x00, 0x19, 0x00, 0x1a, 0x00];
+        let resp = [
+            0x80, 0x28, 0x00, 0x01, 0x04, 0x40, 0x59, 0x01, 0x00, 0x19, 0x00, 0x1a, 0x00,
+        ];
         let slots = decode_slots(&resp, &[0, 1, 0x19, 0x1a]);
         assert_eq!(
             slots,
             vec![
-                PwmSlot { index: 0x00, forced: false, value: 0x59 },
-                PwmSlot { index: 0x01, forced: false, value: 0x00 },
-                PwmSlot { index: 0x19, forced: false, value: 0x00 },
-                PwmSlot { index: 0x1a, forced: false, value: 0x00 },
+                PwmSlot {
+                    index: 0x00,
+                    forced: false,
+                    value: 0x59
+                },
+                PwmSlot {
+                    index: 0x01,
+                    forced: false,
+                    value: 0x00
+                },
+                PwmSlot {
+                    index: 0x19,
+                    forced: false,
+                    value: 0x00
+                },
+                PwmSlot {
+                    index: 0x1a,
+                    forced: false,
+                    value: 0x00
+                },
             ]
         );
     }
@@ -174,7 +197,9 @@ mod tests {
     #[test]
     fn decode_slots_real_response_forced_40() {
         // 40% 強制時の実機応答（index0 → 0xc0 = index0|bit7, value 0x28）
-        let resp = [0x80, 0x28, 0x00, 0x01, 0x04, 0xc0, 0x28, 0x01, 0x00, 0x19, 0x00, 0x1a, 0x00];
+        let resp = [
+            0x80, 0x28, 0x00, 0x01, 0x04, 0xc0, 0x28, 0x01, 0x00, 0x19, 0x00, 0x1a, 0x00,
+        ];
         let slots = decode_slots(&resp, &[0, 1, 0x19, 0x1a]);
         assert_eq!(slots[0].index, 0x00);
         assert!(slots[0].forced);

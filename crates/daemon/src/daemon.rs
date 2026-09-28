@@ -11,7 +11,7 @@ use pmgfan_core::control::{ControlParams, RateLimiter};
 use pmgfan_core::curve::Curve;
 use pmgfan_core::fan::FanReading;
 use pmgfan_core::hwmon;
-use pmgfan_core::protocol::{DaemonState, Mode};
+use pmgfan_core::protocol::{CurveSpec, DaemonState, Mode};
 use pmgfan_core::sensor::{self, TempReading};
 use pmgfan_ipmi::backend::FanControlBackend;
 use pmgfan_ipmi::fujitsu;
@@ -69,6 +69,9 @@ pub struct Params {
     pub fail_action: FailAction,
     /// 起動時に FRU 製品名を照合する期待値
     pub expected_model: String,
+    /// 起動に使った設定ファイル。SetCurves の永続化先
+    /// （None なら実行時適用のみでファイルは書かない）
+    pub config_path: Option<PathBuf>,
 }
 
 /// デーモンの共有状態。
@@ -112,14 +115,17 @@ pub struct Shared {
     pub zero_rpm_count: u32,
     /// 最後にファン読み取りが成功した時刻（watchdog の鮮度判定用）
     pub last_poll_ok: Instant,
+    /// 現在有効なファンカーブ（SetCurves で実行時更新される）
+    pub curves: Vec<Curve>,
     pub started: Instant,
 }
 
 impl Shared {
-    fn new(startup_mode: Mode) -> Self {
+    fn new(startup_mode: Mode, curves: Vec<Curve>) -> Self {
         Self {
             state: DaemonState::Starting,
             mode: startup_mode,
+            curves,
             mode_generation: 0,
             pwm: None,
             fans: Vec::new(),
@@ -185,7 +191,10 @@ where
     B: FanControlBackend + Send + Sync + 'static,
 {
     let backend = Arc::new(backend);
-    let shared = Arc::new(RwLock::new(Shared::new(params.startup_mode.clone())));
+    let shared = Arc::new(RwLock::new(Shared::new(
+        params.startup_mode.clone(),
+        params.curves.clone(),
+    )));
     let socket_path = params.socket_path.clone();
 
     // 単一インスタンスロック。2重起動は IPMI 操作・socket 掃除で
@@ -202,7 +211,10 @@ where
         Ok(model) if model.contains(&params.expected_model) => {
             info!(model = %model, "product model verified");
         }
-        Ok(model) => bail!("unexpected product '{model}' (expected '{}')", params.expected_model),
+        Ok(model) => bail!(
+            "unexpected product '{model}' (expected '{}')",
+            params.expected_model
+        ),
         Err(e) => bail!("cannot verify product model: {e}"),
     }
 
@@ -248,7 +260,6 @@ where
         let ctrl = Arc::clone(&ctrl);
         let apply_interval = params.apply_interval;
         let control_params = params.control;
-        let curves = params.curves.clone();
         let limit = params.ipmi_failure_limit;
         let (cpu_em, pch_em) = (params.cpu_emergency, params.pch_emergency);
         let stale_secs = params.sensor_stale.as_secs();
@@ -260,7 +271,6 @@ where
                 &ctrl,
                 sd_rx,
                 control_params,
-                &curves,
                 apply_interval,
                 limit,
                 cpu_em,
@@ -277,11 +287,11 @@ where
     let ipc_task = {
         let backend = Arc::clone(&backend);
         let shared = Arc::clone(&shared);
-        let curves = Arc::new(params.curves.clone());
         let ctrl = Arc::clone(&ctrl);
         let control_params = params.control;
+        let config_path = params.config_path.clone();
         tokio::spawn(async move {
-            ipc::serve(listener, backend, shared, curves, ctrl, control_params).await
+            ipc::serve(listener, backend, shared, ctrl, control_params, config_path).await
         })
     };
 
@@ -516,7 +526,6 @@ async fn control_loop<B: FanControlBackend>(
     ctrl: &Mutex<()>,
     mut shutdown: watch::Receiver<bool>,
     params: ControlParams,
-    curves: &[Curve],
     apply_interval: Duration,
     failure_limit: u32,
     cpu_emergency: f32,
@@ -548,12 +557,13 @@ async fn control_loop<B: FanControlBackend>(
         }
         // PWM 操作は apply_mode の即時解除と直列化する
         let _ctrl = ctrl.lock().await;
-        let (mode, gen, temps, applied_pwm, clear_pending, sensor_stale, zero_rpm) = {
+        let (mode, gen, temps, curves, applied_pwm, clear_pending, sensor_stale, zero_rpm) = {
             let s = shared.read().await;
             (
                 s.mode.clone(),
                 s.mode_generation,
                 s.temps.clone(),
+                s.curves.clone(),
                 s.pwm,
                 s.clear_pending,
                 s.last_temp_ok.elapsed() > Duration::from_secs(sensor_stale_secs),
@@ -690,7 +700,7 @@ async fn control_loop<B: FanControlBackend>(
                 if temps.is_empty() {
                     continue;
                 }
-                let (target, missing) = curve_demand(curves, &temps);
+                let (target, missing) = curve_demand(&curves, &temps);
                 // 新たに解決不能になったセンサーだけ warn（ログスパム防止）
                 for name in missing.iter().filter(|n| !missing_sensors.contains(n)) {
                     warn!(sensor = %name, "curve sensor not readable");
@@ -873,9 +883,8 @@ fn read_hwmon() -> Vec<TempReading> {
 fn acquire_instance_lock(run_dir: &Path) -> Result<std::fs::File> {
     // ディレクトリを作成した場合のみ 0750 + pmgfan グループを
     // 適用する（systemd 経由では unit の Group=pmgfan が用意する）
-    ipc::prepare_runtime_dir(run_dir).with_context(|| {
-        format!("cannot create runtime directory {}", run_dir.display())
-    })?;
+    ipc::prepare_runtime_dir(run_dir)
+        .with_context(|| format!("cannot create runtime directory {}", run_dir.display()))?;
     let lock_path = run_dir.join("pmgfand.lock");
     let file = std::fs::File::create(&lock_path)
         .with_context(|| format!("cannot open {}", lock_path.display()))?;
@@ -898,7 +907,6 @@ pub async fn apply_mode<B: FanControlBackend>(
     shared: &RwLock<Shared>,
     ctrl: &Mutex<()>,
     params: &ControlParams,
-    curves: &[Curve],
     mode: &Mode,
 ) -> std::result::Result<(), String> {
     match mode {
@@ -932,13 +940,14 @@ pub async fn apply_mode<B: FanControlBackend>(
         }
         Mode::FixedPwm(p) => {
             if *p > params.max_pwm {
-                return Err(format!("pwm {p}% is above configured max {}%", params.max_pwm));
+                return Err(format!(
+                    "pwm {p}% is above configured max {}%",
+                    params.max_pwm
+                ));
             }
             let floor = params.min_pwm.max(fujitsu::MIN_SAFE_PWM);
             if *p < floor {
-                return Err(format!(
-                    "pwm {p}% is below the allowed floor {floor}%"
-                ));
+                return Err(format!("pwm {p}% is below the allowed floor {floor}%"));
             }
             let mut s = shared.write().await;
             s.mode = mode.clone();
@@ -947,7 +956,7 @@ pub async fn apply_mode<B: FanControlBackend>(
             Ok(())
         }
         Mode::Curve => {
-            if curves.is_empty() {
+            if shared.read().await.curves.is_empty() {
                 return Err("no fan curves configured".into());
             }
             let mut s = shared.write().await;
@@ -956,10 +965,111 @@ pub async fn apply_mode<B: FanControlBackend>(
             info!("mode -> curve");
             Ok(())
         }
-        Mode::TargetRpm { .. } => {
-            Err("mode not implemented yet (roadmap phase 7)".into())
-        }
+        Mode::TargetRpm { .. } => Err("mode not implemented yet (roadmap phase 7)".into()),
     }
+}
+
+/// `Curve` を IPC のワイヤ表現へ変換する。
+pub fn curve_to_spec(c: &Curve) -> CurveSpec {
+    CurveSpec {
+        sensor: c.sensor.clone(),
+        points: c.points.iter().map(|p| (p.temp, p.pwm)).collect(),
+    }
+}
+
+/// SetCurves 要求の検証。通れば `Curve` のリストに変換する。
+///
+/// `Curve::new` の検査（2点以上・温度厳密昇順・PWM 0..=100・
+/// 有限値）に加えて、制御設定と矛盾しないことを確認する:
+/// - 各点の PWM は `min_pwm` 以上（制御下限を下回る要求は
+///   カーブとして意味を持たない）
+/// - 最終点の PWM は `max_pwm` 以上（高温域で必ず最大風量へ
+///   到達するカーブであることを保証する）
+/// - 温度は 0..=150 ℃
+pub fn validate_curves(
+    specs: &[CurveSpec],
+    params: &ControlParams,
+) -> std::result::Result<Vec<Curve>, String> {
+    if specs.is_empty() {
+        return Err("at least one curve is required".into());
+    }
+    let mut out = Vec::with_capacity(specs.len());
+    for spec in specs {
+        if spec.sensor.trim().is_empty() {
+            return Err("curve sensor name must not be empty".into());
+        }
+        let curve =
+            Curve::new(spec.sensor.clone(), spec.points.clone()).map_err(|e| e.to_string())?;
+        for (i, p) in curve.points.iter().enumerate() {
+            if !(0.0..=150.0).contains(&p.temp) {
+                return Err(format!(
+                    "curve '{}': point {i} temp {} is out of range 0..=150C",
+                    curve.sensor, p.temp
+                ));
+            }
+            if p.pwm < params.min_pwm as f32 {
+                return Err(format!(
+                    "curve '{}': point {i} pwm {}% is below min_pwm {}%",
+                    curve.sensor, p.pwm, params.min_pwm
+                ));
+            }
+            if p.pwm > params.max_pwm as f32 {
+                return Err(format!(
+                    "curve '{}': point {i} pwm {}% is above max_pwm {}%",
+                    curve.sensor, p.pwm, params.max_pwm
+                ));
+            }
+        }
+        let last = curve.points.last().expect("validated >= 2 points");
+        if last.pwm < params.max_pwm as f32 {
+            return Err(format!(
+                "curve '{}': last point pwm {}% is below max_pwm {}% \
+                 (the curve must reach full demand at high temperature)",
+                curve.sensor, last.pwm, params.max_pwm
+            ));
+        }
+        out.push(curve);
+    }
+    Ok(out)
+}
+
+/// 検証済みカーブを設定ファイルの `[[curve]]` セクションへ
+/// 書き戻す。`toml_edit` で他のキーとコメントを保持する。
+/// 直接 `write` せず tmp + rename で中途半端なファイルを残さない。
+pub fn persist_curves(path: &Path, curves: &[Curve]) -> Result<()> {
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
+    let mut doc = text
+        .parse::<toml_edit::DocumentMut>()
+        .with_context(|| format!("cannot parse {}", path.display()))?;
+    doc.remove("curve");
+    let mut arr = toml_edit::ArrayOfTables::new();
+    for c in curves {
+        let mut t = toml_edit::Table::new();
+        t["sensor"] = toml_edit::value(c.sensor.clone());
+        let mut pts = toml_edit::Array::new();
+        for p in &c.points {
+            let mut pair = toml_edit::Array::new();
+            pair.push(p.temp as f64);
+            pair.push(p.pwm as f64);
+            pts.push(pair);
+        }
+        t["points"] = toml_edit::Item::Value(toml_edit::Value::Array(pts));
+        arr.push(t);
+    }
+    doc["curve"] = toml_edit::Item::ArrayOfTables(arr);
+
+    let tmp = path.with_file_name(format!(
+        ".{}.tmp",
+        path.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "config.toml".into())
+    ));
+    std::fs::write(&tmp, doc.to_string())
+        .with_context(|| format!("cannot write {}", tmp.display()))?;
+    std::fs::rename(&tmp, path)
+        .with_context(|| format!("cannot rename {} -> {}", tmp.display(), path.display()))?;
+    Ok(())
 }
 
 /// `NOTIFY_SOCKET` があれば sd_notify を送る。
@@ -1054,7 +1164,10 @@ mod tests {
         ) -> impl std::future::Future<Output = IpmiResult<Vec<TempReading>>> + Send {
             async move { Ok(self.temps.clone()) }
         }
-        fn set_global_pwm(&self, pwm: u8) -> impl std::future::Future<Output = IpmiResult<()>> + Send {
+        fn set_global_pwm(
+            &self,
+            pwm: u8,
+        ) -> impl std::future::Future<Output = IpmiResult<()>> + Send {
             async move {
                 if self.fail_write.load(Ordering::SeqCst) {
                     return Err(IpmiError::Parse("mock write failure".into()));
@@ -1092,7 +1205,7 @@ mod tests {
     }
 
     fn shared_with_mode(mode: Mode) -> RwLock<Shared> {
-        RwLock::new(Shared::new(mode))
+        RwLock::new(Shared::new(mode, vec![]))
     }
 
     #[tokio::test]
@@ -1101,15 +1214,15 @@ mod tests {
         let s = shared_with_mode(Mode::IrmcAuto);
         let c = Mutex::new(());
         // 設定下限未満は拒否
-        assert!(apply_mode(&b, &s, &c, &params(), &[], &Mode::FixedPwm(10))
+        assert!(apply_mode(&b, &s, &c, &params(), &Mode::FixedPwm(10))
             .await
             .is_err());
         // 上限超過も拒否
-        assert!(apply_mode(&b, &s, &c, &params(), &[], &Mode::FixedPwm(101))
+        assert!(apply_mode(&b, &s, &c, &params(), &Mode::FixedPwm(101))
             .await
             .is_err());
         // 範囲内は受け付けてモード反映
-        assert!(apply_mode(&b, &s, &c, &params(), &[], &Mode::FixedPwm(40))
+        assert!(apply_mode(&b, &s, &c, &params(), &Mode::FixedPwm(40))
             .await
             .is_ok());
         let s = s.read().await;
@@ -1127,7 +1240,7 @@ mod tests {
             w.state = DaemonState::Controlling;
         }
         let c = Mutex::new(());
-        apply_mode(&b, &s, &c, &params(), &[], &Mode::IrmcAuto)
+        apply_mode(&b, &s, &c, &params(), &Mode::IrmcAuto)
             .await
             .unwrap();
         let s = s.read().await;
@@ -1144,7 +1257,7 @@ mod tests {
         let s = shared_with_mode(Mode::Curve);
         s.write().await.pwm = Some(40);
         let c = Mutex::new(());
-        assert!(apply_mode(&b, &s, &c, &params(), &[], &Mode::IrmcAuto)
+        assert!(apply_mode(&b, &s, &c, &params(), &Mode::IrmcAuto)
             .await
             .is_err());
         let s = s.read().await;
@@ -1173,7 +1286,7 @@ mod tests {
     fn refresh_state_tracks_all_failure_domains() {
         // 失敗ドメインのいずれかが閾値超過なら Degraded、
         // 全部健全になって初めて normal に戻る（フラッピング防止）
-        let mut s = Shared::new(Mode::Curve);
+        let mut s = Shared::new(Mode::Curve, vec![]);
         s.state = DaemonState::Degraded;
         s.temp_failures = 3;
         s.fan_failures = 0;
@@ -1186,7 +1299,7 @@ mod tests {
         s.clear_pending = false;
         refresh_state(&mut s, 3);
         assert_eq!(s.state, DaemonState::Controlling); // 全解消で回復
-        // Failsafe（緊急温度）はここでは上書きしない
+                                                       // Failsafe（緊急温度）はここでは上書きしない
         s.state = DaemonState::Failsafe;
         s.fan_failures = 0;
         refresh_state(&mut s, 3);
@@ -1198,7 +1311,7 @@ mod tests {
         let b = MockBackend::new();
         let s = shared_with_mode(Mode::IrmcAuto);
         let c = Mutex::new(());
-        assert!(apply_mode(&b, &s, &c, &params(), &[], &Mode::Curve)
+        assert!(apply_mode(&b, &s, &c, &params(), &Mode::Curve)
             .await
             .is_err());
     }
@@ -1226,13 +1339,15 @@ mod tests {
     /// 緊急温度復帰の回帰テスト。`control_loop` を短命間隔で
     /// 実際に回し、Failsafe 発動→温度正常化→各モードの
     /// 期待状態への復帰を確認する。
-    async fn run_emergency_cycle(mode: Mode) -> (
+    async fn run_emergency_cycle(
+        mode: Mode,
+    ) -> (
         Arc<RwLock<Shared>>,
         Arc<MockBackend>,
         tokio::sync::watch::Sender<bool>,
     ) {
         let b = Arc::new(MockBackend::new());
-        let s = Arc::new(RwLock::new(Shared::new(mode)));
+        let s = Arc::new(RwLock::new(Shared::new(mode, vec![])));
         let c = Arc::new(Mutex::new(()));
         let (tx, rx) = watch::channel(false);
         let (bb, ss, cc) = (Arc::clone(&b), Arc::clone(&s), Arc::clone(&c));
@@ -1243,7 +1358,6 @@ mod tests {
                 cc.as_ref(),
                 rx,
                 params(),
-                &[],
                 Duration::from_millis(10),
                 3,
                 90.0,
@@ -1304,7 +1418,7 @@ mod tests {
     #[tokio::test]
     async fn sensor_stale_triggers_irmc_auto_and_recovers() {
         let b = Arc::new(MockBackend::new());
-        let s = Arc::new(RwLock::new(Shared::new(Mode::FixedPwm(50))));
+        let s = Arc::new(RwLock::new(Shared::new(Mode::FixedPwm(50), vec![])));
         let c = Arc::new(Mutex::new(()));
         let (tx, rx) = watch::channel(false);
         let (bb, ss, cc) = (Arc::clone(&b), Arc::clone(&s), Arc::clone(&c));
@@ -1315,7 +1429,6 @@ mod tests {
                 cc.as_ref(),
                 rx,
                 params(),
-                &[],
                 Duration::from_millis(10),
                 3,
                 90.0,
@@ -1364,7 +1477,7 @@ mod tests {
     #[tokio::test]
     async fn sensor_stale_full_speed_action() {
         let b = Arc::new(MockBackend::new());
-        let s = Arc::new(RwLock::new(Shared::new(Mode::FixedPwm(50))));
+        let s = Arc::new(RwLock::new(Shared::new(Mode::FixedPwm(50), vec![])));
         let c = Arc::new(Mutex::new(()));
         let (tx, rx) = watch::channel(false);
         let (bb, ss, cc) = (Arc::clone(&b), Arc::clone(&s), Arc::clone(&c));
@@ -1375,7 +1488,6 @@ mod tests {
                 cc.as_ref(),
                 rx,
                 params(),
-                &[],
                 Duration::from_millis(10),
                 3,
                 90.0,
@@ -1418,7 +1530,7 @@ mod tests {
             status: FanStatus::Ok,
         }];
         let b = Arc::new(mb);
-        let s = Arc::new(RwLock::new(Shared::new(Mode::FixedPwm(50))));
+        let s = Arc::new(RwLock::new(Shared::new(Mode::FixedPwm(50), vec![])));
         let (_tx, rx) = watch::channel(false);
         let (bb, ss) = (Arc::clone(&b), Arc::clone(&s));
         let task = tokio::spawn(async move {
@@ -1432,6 +1544,94 @@ mod tests {
             assert!(st.last_error.as_ref().unwrap().contains("FAN CPU"));
         }
         task.abort();
+    }
+
+    #[test]
+    fn validate_curves_enforces_config_bounds() {
+        let p = params();
+        let ok = vec![CurveSpec {
+            sensor: "cpu".into(),
+            points: vec![(35.0, 30.0), (90.0, 100.0)],
+        }];
+        assert!(validate_curves(&ok, &p).is_ok());
+        // 空リストは拒否
+        assert!(validate_curves(&[], &p).is_err());
+        // 空センサー名は拒否
+        assert!(validate_curves(
+            &[CurveSpec {
+                sensor: " ".into(),
+                points: vec![(30.0, 30.0), (90.0, 100.0)]
+            }],
+            &p
+        )
+        .is_err());
+        // min_pwm 未満は拒否
+        assert!(validate_curves(
+            &[CurveSpec {
+                sensor: "cpu".into(),
+                points: vec![(35.0, 20.0), (90.0, 100.0)]
+            }],
+            &p
+        )
+        .is_err());
+        // 最終点が max_pwm 未満 = 高温域で全開にならない → 拒否
+        assert!(validate_curves(
+            &[CurveSpec {
+                sensor: "cpu".into(),
+                points: vec![(35.0, 30.0), (90.0, 80.0)]
+            }],
+            &p
+        )
+        .is_err());
+        // 温度範囲外は拒否
+        assert!(validate_curves(
+            &[CurveSpec {
+                sensor: "cpu".into(),
+                points: vec![(35.0, 30.0), (200.0, 100.0)]
+            }],
+            &p
+        )
+        .is_err());
+        // 非昇順は Curve::new が拒否
+        assert!(validate_curves(
+            &[CurveSpec {
+                sensor: "cpu".into(),
+                points: vec![(90.0, 30.0), (35.0, 100.0)]
+            }],
+            &p
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn persist_curves_rewrites_curve_sections_preserving_rest() {
+        let dir = std::env::temp_dir().join(format!("pmgfan-persist-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "# comment\n[device]\nmodel = \"X\"\n\n[[curve]]\nsensor = \"old\"\npoints = [[10, 30]]\n",
+        )
+        .unwrap();
+        let curves = vec![
+            Curve::new("cpu_package", vec![(35.0, 30.0), (90.0, 100.0)]).unwrap(),
+            Curve::new("pch", vec![(45.0, 30.0), (90.0, 100.0)]).unwrap(),
+        ];
+        persist_curves(&path, &curves).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        // 他セクション・コメントが残る
+        assert!(text.contains("# comment"));
+        assert!(text.contains("[device]"));
+        // 新しいカーブが書き込まれ、古いエントリは消える
+        assert!(text.contains("cpu_package"));
+        assert!(text.contains("pch"));
+        assert!(!text.contains("\"old\""));
+        // 書き戻したものが Config として再パースできる
+        let cfg: pmgfan_core::config::Config = toml::from_str(&text).unwrap();
+        assert_eq!(cfg.curves.len(), 2);
+        assert_eq!(cfg.curves[0].sensor, "cpu_package");
+        assert_eq!(cfg.curves[0].points[1], (90.0, 100.0));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

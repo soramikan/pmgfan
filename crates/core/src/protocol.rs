@@ -36,11 +36,28 @@ pub enum DaemonState {
     Failsafe,
 }
 
+/// カーブのワイヤ表現。`config::CurveConfig` と同形だが
+/// カスタム deserializer を持たない素直な型にする。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CurveSpec {
+    pub sensor: String,
+    /// `(temp_celsius, pwm_percent)` を温度昇順で
+    pub points: Vec<(f32, f32)>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
     GetStatus,
-    SetMode { mode: Mode },
+    SetMode {
+        mode: Mode,
+    },
+    /// 現在のカーブ一覧を返す（ランタイム編集込み）
+    GetCurves,
+    /// カーブを検証・設定ファイル永続化・ランタイム適用する
+    SetCurves {
+        curves: Vec<CurveSpec>,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -56,6 +73,9 @@ pub enum Response {
         uptime_secs: f64,
     },
     Ok,
+    Curves {
+        curves: Vec<CurveSpec>,
+    },
     Error {
         error: String,
     },
@@ -112,16 +132,20 @@ mod tests {
             rpm: 2500,
         })
         .unwrap();
-        assert_eq!(rpm, serde_json::json!({"target_rpm": {"fan": "FAN CPU", "rpm": 2500}}));
+        assert_eq!(
+            rpm,
+            serde_json::json!({"target_rpm": {"fan": "FAN CPU", "rpm": 2500}})
+        );
     }
 
     #[test]
     fn decodes_design_example_request() {
         let req = decode_request(r#"{"version":1,"type":"get_status"}"#).unwrap();
         assert!(matches!(req, Request::GetStatus));
-        let req =
-            decode_request(r#"{"type":"set_mode","mode":{"target_rpm":{"fan":"FAN CPU","rpm":2500}}}"#)
-                .unwrap();
+        let req = decode_request(
+            r#"{"type":"set_mode","mode":{"target_rpm":{"fan":"FAN CPU","rpm":2500}}}"#,
+        )
+        .unwrap();
         assert!(matches!(
             req,
             Request::SetMode {

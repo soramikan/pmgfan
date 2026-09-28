@@ -117,17 +117,14 @@ async fn main() -> Result<()> {
                 }
                 Cmd::Temps => {
                     let mut temps = backend.temperatures().await?;
-                    temps
-                        .extend(hwmon::read_temperatures(Path::new(hwmon::HWMON_ROOT))
-                            .unwrap_or_default());
+                    temps.extend(
+                        hwmon::read_temperatures(Path::new(hwmon::HWMON_ROOT)).unwrap_or_default(),
+                    );
                     print_temps(&temps);
                     Ok(())
                 }
                 Cmd::Monitor { interval } => monitor(&backend, interval).await,
-                Cmd::SetPwm {
-                    percent,
-                    allow_low,
-                } => {
+                Cmd::SetPwm { percent, allow_low } => {
                     if percent > fujitsu::MAX_PWM {
                         bail!("percent must be 0..=100, got {percent}");
                     }
@@ -235,8 +232,8 @@ fn build_params(config_path: Option<&Path>, socket: PathBuf) -> Result<(daemon::
     if config.safety.sensor_stale_seconds == 0 {
         bail!("[safety] sensor_stale_seconds must be >= 1");
     }
-    let fail_action = daemon::FailAction::parse(&config.safety.fail_action)
-        .map_err(anyhow::Error::msg)?;
+    let fail_action =
+        daemon::FailAction::parse(&config.safety.fail_action).map_err(anyhow::Error::msg)?;
     // 機種照合は空文字だと contains() が常に真となり
     // 検証が無効化されるため拒否する
     if config.device.model.trim().is_empty() {
@@ -308,6 +305,7 @@ fn build_params(config_path: Option<&Path>, socket: PathBuf) -> Result<(daemon::
         sensor_stale: Duration::from_secs(config.safety.sensor_stale_seconds),
         fail_action,
         expected_model: config.device.model.clone(),
+        config_path: config_path.map(|p| p.to_path_buf()),
     };
     Ok((params, config.device.interface))
 }
@@ -325,9 +323,11 @@ async fn probe(backend: &IpmitoolBackend) -> Result<()> {
         }
     }
     let fru = backend.fru().await.context("ipmitool fru print failed")?;
-    let product = fru
-        .lines()
-        .find_map(|l| l.split_once(':').filter(|(k, _)| k.trim() == "Product Name").map(|(_, v)| v.trim().to_string()));
+    let product = fru.lines().find_map(|l| {
+        l.split_once(':')
+            .filter(|(k, _)| k.trim() == "Product Name")
+            .map(|(_, v)| v.trim().to_string())
+    });
     match product {
         Some(p) if p.contains(EXPECTED_PRODUCT) => println!("Product Name : {p}  [OK]"),
         Some(p) => println!("Product Name : {p}  [WARN: expected '{EXPECTED_PRODUCT}']"),
@@ -385,7 +385,8 @@ fn parse_indices(args: &[String]) -> Result<Vec<u8>> {
             let idx = if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
                 u8::from_str_radix(hex, 16).map_err(|e| anyhow::anyhow!("bad index '{s}': {e}"))?
             } else {
-                s.parse::<u8>().map_err(|e| anyhow::anyhow!("bad index '{s}': {e}"))?
+                s.parse::<u8>()
+                    .map_err(|e| anyhow::anyhow!("bad index '{s}': {e}"))?
             };
             if idx > 31 {
                 bail!("slot index out of range 0..31: {idx}");
