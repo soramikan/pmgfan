@@ -7,7 +7,9 @@ Type=notify
 ExecStart=/usr/sbin/pmgfand \
     --config /etc/pmgfand/config.toml
 
-ExecStopPost=/usr/sbin/pmgfand clear-override
+# --config を渡して ExecStart と同じバックエンドで解除する
+# （[device] backend = "native" 時も正しく ipmitool 非依存で解除できる）
+ExecStopPost=/usr/sbin/pmgfand --config /etc/pmgfand/config.toml clear-override
 
 Restart=on-failure
 RestartSec=2s

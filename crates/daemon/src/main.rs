@@ -36,8 +36,8 @@ const EXPECTED_PRODUCT: &str = "PRIMERGY TX1320 M4";
 )]
 struct Cli {
     /// ipmitool バイナリ
-    #[arg(long, global = true, default_value = "ipmitool")]
-    ipmitool: OsString,
+    #[arg(long, global = true)]
+    ipmitool: Option<OsString>,
     /// ipmitool -I のインターフェース（未指定時は config [device] interface → "open"）
     #[arg(short = 'I', long, global = true)]
     interface: Option<String>,
@@ -203,6 +203,9 @@ fn build_backend(cli: &Cli, dev: &DeviceConfig) -> Result<Backend> {
     let name = cli.backend.as_deref().unwrap_or(&dev.backend);
     match name {
         "ipmitool" => {
+            if cli.device.is_some() {
+                eprintln!("warning: --device is ignored with backend \"ipmitool\"");
+            }
             let iface = cli
                 .interface
                 .clone()
@@ -211,11 +214,14 @@ fn build_backend(cli: &Cli, dev: &DeviceConfig) -> Result<Backend> {
                 bail!("[device] interface must not be empty");
             }
             Ok(Backend::Ipmitool(IpmitoolBackend::new(
-                cli.ipmitool.clone(),
+                cli.ipmitool.clone().unwrap_or_else(|| "ipmitool".into()),
                 iface,
             )))
         }
         "native" | "openipmi" => {
+            if cli.interface.is_some() || cli.ipmitool.is_some() {
+                eprintln!("warning: -I/--ipmitool are ignored with backend \"native\"");
+            }
             let path = cli
                 .device
                 .clone()

@@ -9,7 +9,8 @@
 //! - 読み取り: `Get Sensor Reading` の raw 値をレコードの
 //!   M/B/R_exp/B_exp で線形化（`y = (Mx + B·10^Bexp)·10^Rexp`）
 //! - OEM 制御: NetFn 0x2e / Cmd 0xf5 をそのまま送信
-//! - `model_name()`: FRU 0 の Product Info Area から Product Name を取得
+//! - `model_name()`: FRU を順に走査し、最初に見つかった Product Info
+//!   Area の Product Name を返す（TX1320 M4 では FRU 2 = Chassis）
 
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
@@ -36,6 +37,10 @@ const SCAN_RETRIES: u32 = 3;
 /// チェーンを返しても、デバイスロックを握ったまま無限巡回しないための上限。
 /// （実機 TX1320 M4 は ~156 レコード）
 const MAX_SDR_RECORDS: usize = 1024;
+/// `O_NONBLOCK` 下で SMI が忙しいと SEND_COMMAND が EAGAIN を返す。
+/// ポーリング毎に失敗としてカウントしないよう短いバックオフで再試行する。
+const SEND_RETRIES: u32 = 5;
+const SEND_RETRY_DELAY: Duration = Duration::from_millis(20);
 
 const NETFN_SENSOR: u8 = 0x04;
 const NETFN_APP: u8 = 0x06;
@@ -141,6 +146,10 @@ impl Device {
     /// netfn/cmd/data で1要求を送り、completion code を剥がした
     /// 応答データを返す。cc != 0 は `IpmiError::Completion`。
     fn request(&mut self, netfn: u8, cmd: u8, data: &[u8]) -> Result<Vec<u8>> {
+        if data.len() > u16::MAX as usize {
+            // ipmi_msg.data_len は u16。超過は静音切り詰めにせず拒否する
+            return Err(IpmiError::Parse("ipmi request payload too large".into()));
+        }
         self.msgid = self.msgid.wrapping_add(1);
         let msgid = self.msgid;
 
@@ -160,8 +169,21 @@ impl Device {
                 data: data.as_ptr() as *mut u8,
             },
         };
-        if unsafe { libc::ioctl(self.file.as_raw_fd(), IPMICTL_SEND_COMMAND, &req) } < 0 {
-            return Err(std::io::Error::last_os_error().into());
+        // O_NONBLOCK 下では BMC/SMI が忙しいと EAGAIN で失敗する。
+        // 一過性の輻輳で poll 失敗扱いにならないよう短く再試行する。
+        let mut send_attempts = 0u32;
+        loop {
+            let r = unsafe { libc::ioctl(self.file.as_raw_fd(), IPMICTL_SEND_COMMAND, &req) };
+            if r >= 0 {
+                break;
+            }
+            let e = std::io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::EAGAIN) && send_attempts < SEND_RETRIES {
+                send_attempts += 1;
+                std::thread::sleep(SEND_RETRY_DELAY);
+                continue;
+            }
+            return Err(e.into());
         }
 
         // 応答を poll → receive。非同期イベントや msgid の不一致は捨てる。
@@ -299,23 +321,28 @@ fn decode_id_string(id_code: u8, data: &[u8]) -> Option<String> {
             Some(s.trim_end().to_string())
         }
         2 => {
-            // 6-bit ASCII: 3バイト→4文字。文字値 +0x20。
+            // 6-bit ASCII: [5:0] length は packed データの
+            // **バイト数**（3バイト→4文字）。末尾の不完全グループは
+            // 残バイト数で解ける文字だけ取り出す（1B→1文字, 2B→2文字）。
+            let data = &data[..len.min(data.len())];
             let mut out = String::new();
-            for chunk in data.chunks(3) {
-                let b0 = chunk[0] as u32;
-                let b1 = *chunk.get(1).unwrap_or(&0) as u32;
-                let b2 = *chunk.get(2).unwrap_or(&0) as u32;
-                let chars = [
-                    b0 & 0x3f,
-                    ((b0 >> 6) | ((b1 & 0x0f) << 2)) & 0x3f,
-                    ((b1 >> 4) | ((b2 & 0x03) << 4)) & 0x3f,
-                    (b2 >> 2) & 0x3f,
-                ];
-                for c in chars {
-                    if out.len() < len {
-                        out.push(char::from_u32(c + 0x20).unwrap_or(' '));
-                    }
+            let mut pos = 0;
+            while pos < data.len() {
+                let b0 = data[pos] as u32;
+                let b1 = *data.get(pos + 1).unwrap_or(&0) as u32;
+                let b2 = *data.get(pos + 2).unwrap_or(&0) as u32;
+                let mut push = |c: u32| {
+                    out.push(char::from_u32((c & 0x3f) + 0x20).unwrap_or(' '));
+                };
+                push(b0);
+                if pos + 1 < data.len() {
+                    push((b0 >> 6) | ((b1 & 0x0f) << 2));
                 }
+                if pos + 2 < data.len() {
+                    push((b1 >> 4) | ((b2 & 0x03) << 4));
+                    push(b2 >> 2);
+                }
+                pos += 3;
             }
             Some(out.trim_end().to_string())
         }
@@ -337,7 +364,8 @@ fn parse_full_sensor(rec: &[u8]) -> Option<FullSensor> {
         event_type: rec[13] & 0x7f,
         analog_fmt: rec[20] >> 6,
         unit_base: rec[21],
-        linearization: rec[23],
+        // bit7 は reserved
+        linearization: rec[23] & 0x7f,
         m: sext10(rec[24] as u32 | (((rec[25] & 0xc0) as u32) << 2)),
         b: sext10(rec[26] as u32 | (((rec[27] & 0xc0) as u32) << 2)),
         r_exp: sext4(rec[29] >> 4),
@@ -378,24 +406,30 @@ enum SensorReading {
     Unavailable,
 }
 
+/// `Get Sensor Reading` 応答（completion code 剥がし済み）のパース。
+/// 応答 byte2 のフラグ構成（IPMI Table 35-15）:
+///   bit7 = event messages enabled（0 = 無効）
+///   bit6 = sensor scanning enabled（**0 = 無効**。無効時の生値は
+///          最終ラッチ値であり、生きた読み取りではない → 欠測扱い）
+///   bit5 = reading/state unavailable
+///   bit4:0 = reserved
+/// 実機（iRMC S5）の健全センサーは 0xc0 を返す。
+fn parse_sensor_reading(d: &[u8]) -> Result<SensorReading> {
+    if d.len() < 2 {
+        return Err(IpmiError::Parse("short sensor reading".into()));
+    }
+    if d[1] & 0x20 != 0 || d[1] & 0x40 == 0 {
+        return Ok(SensorReading::Unavailable);
+    }
+    Ok(SensorReading::Value {
+        raw: d[0],
+        thr: *d.get(2).unwrap_or(&0),
+    })
+}
+
 fn get_sensor_reading(dev: &mut Device, sensor_num: u8) -> Result<SensorReading> {
-    let r = dev.request(NETFN_SENSOR, CMD_GET_SENSOR_READING, &[sensor_num]);
-    match r {
-        Ok(d) => {
-            // [raw, status, thr_status?]
-            if d.len() < 2 {
-                return Err(IpmiError::Parse("short sensor reading".into()));
-            }
-            // bit5 = reading unavailable、bit4 = sensor scanning disabled。
-            // どちらも「値が信用できない」ので欠測扱い
-            if d[1] & 0x30 != 0 {
-                return Ok(SensorReading::Unavailable);
-            }
-            Ok(SensorReading::Value {
-                raw: d[0],
-                thr: *d.get(2).unwrap_or(&0),
-            })
-        }
+    match dev.request(NETFN_SENSOR, CMD_GET_SENSOR_READING, &[sensor_num]) {
+        Ok(d) => parse_sensor_reading(&d),
         Err(IpmiError::Completion(_)) => Ok(SensorReading::Unavailable),
         Err(e) => Err(e),
     }
@@ -686,13 +720,20 @@ impl FanControlBackend for NativeBackend {
             self.run(|d| {
                 // FRU デバイスを順に探し、最初に Product Name が
                 // 取れたものを返す（TX1320 M4 では FRU 2 = Chassis）。
+                // 存在しない FRU の completion error は last_err に
+                // 上書きされ続けるので、「読めた FRU はあるが name が
+                // 無い」場合と「全 FRU が応答しない」場合を分ける。
                 let mut last_err = None;
+                let mut any_ok = false;
                 for fru_id in 0..8u8 {
                     match fru_product_name(d, fru_id) {
                         Ok(Some(name)) => return Ok(name),
-                        Ok(None) => {}
+                        Ok(None) => any_ok = true,
                         Err(e) => last_err = Some(e),
                     }
+                }
+                if any_ok {
+                    return Err(IpmiError::Parse("no FRU product name found".into()));
                 }
                 match last_err {
                     Some(e) => Err(e),
@@ -921,10 +962,55 @@ mod tests {
 
     #[test]
     fn decode_6bit_packed_ascii() {
-        // type=2 ("FAN CPU" は実機では type 3 だが6bit形式も検証)
-        // "ABCD" = 4 chars → 3 bytes
+        // type=2、len はパック後の **バイト数**（4文字→3バイト）
         let data = [0xa1, 0x38, 0x92]; // 'A','B','C','D' (ch-0x20 packed)
-        assert_eq!(decode_id_string(0x84, &data).as_deref(), Some("ABCD"));
+        assert_eq!(decode_id_string(0x83, &data).as_deref(), Some("ABCD"));
+        // 後続のパディングは length バイトで切り捨てる
+        let padded = [0xa1, 0x38, 0x92, 0x00, 0x00];
+        assert_eq!(decode_id_string(0x83, &padded).as_deref(), Some("ABCD"));
+    }
+
+    #[test]
+    fn decode_6bit_packed_full_name() {
+        // "FAN PSU1" = 8文字 → 6バイト。バイト数を文字数と
+        // 誤解すると "FAN PS" に切れてセンサー名照合が壊れる。
+        let data = [0x66, 0xe8, 0x02, 0xf0, 0x5c, 0x47];
+        assert_eq!(decode_id_string(0x86, &data).as_deref(), Some("FAN PSU1"));
+    }
+
+    #[test]
+    fn sensor_reading_flags_byte() {
+        // d = [raw, flags, thr?]。flags: bit7=events on, bit6=scanning
+        // on, bit5=reading unavailable。実機の健全値は 0xc0。
+        assert!(matches!(
+            parse_sensor_reading(&[0x3e, 0xc0, 0xc0]).unwrap(),
+            SensorReading::Value {
+                raw: 0x3e,
+                thr: 0xc0
+            }
+        ));
+        // scanning on のみでも有効（イベント無効でも読み取りは生きている）
+        assert!(matches!(
+            parse_sensor_reading(&[0x3e, 0x40]).unwrap(),
+            SensorReading::Value { .. }
+        ));
+        // scanning disabled (bit6=0) → ラッチ済みの値を欠測扱い
+        assert!(matches!(
+            parse_sensor_reading(&[0x3e, 0x00]).unwrap(),
+            SensorReading::Unavailable
+        ));
+        assert!(matches!(
+            parse_sensor_reading(&[0x3e, 0x80]).unwrap(),
+            SensorReading::Unavailable
+        ));
+        // reading unavailable (bit5)
+        assert!(matches!(
+            parse_sensor_reading(&[0x3e, 0x60]).unwrap(),
+            SensorReading::Unavailable
+        ));
+        // 短い応答はパースエラー（欠測ではなく伝播）
+        assert!(parse_sensor_reading(&[0x3e]).is_err());
+        assert!(parse_sensor_reading(&[]).is_err());
     }
 
     #[test]
