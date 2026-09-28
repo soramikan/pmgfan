@@ -4,14 +4,16 @@
 //! （`IPMICTL_SEND_COMMAND` + `poll` + `IPMICTL_RECEIVE_MSG`）で
 //! iRMC と直接やり取りする。
 //!
-//! - SDR: `Get SDR Repository Info` → `Reserve SDR Repository` →
-//!   `Get SDR` でレコード列挙し、Full Sensor Record (0x01) をパース
+//! - SDR: `Reserve SDR Repository` → `Get SDR` でレコード列挙し、
+//!   Full Sensor Record (0x01) をパース
 //! - 読み取り: `Get Sensor Reading` の raw 値をレコードの
 //!   M/B/R_exp/B_exp で線形化（`y = (Mx + B·10^Bexp)·10^Rexp`）
 //! - OEM 制御: NetFn 0x2e / Cmd 0xf5 をそのまま送信
 //! - `model_name()`: FRU 0 の Product Info Area から Product Name を取得
 
+use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -30,6 +32,10 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(4);
 const SDR_READ_CHUNK: usize = 64;
 /// SDR スキャン中に予約が無効化された場合の再試行上限。
 const SCAN_RETRIES: u32 = 3;
+/// SDR レコード数の上限。異常な BMC が `next_id` で長い/循環する
+/// チェーンを返しても、デバイスロックを握ったまま無限巡回しないための上限。
+/// （実機 TX1320 M4 は ~156 レコード）
+const MAX_SDR_RECORDS: usize = 1024;
 
 const NETFN_SENSOR: u8 = 0x04;
 const NETFN_APP: u8 = 0x06;
@@ -104,6 +110,13 @@ const IPMICTL_RECEIVE_MSG: u64 = ioc(
     std::mem::size_of::<IpmiRecv>() as u64,
 );
 
+// 手書き ABI のサイズを固定する（カーネル uapi と一致しない場合は
+// コンパイル時に検出する）
+const _: () = assert!(std::mem::size_of::<IpmiMsg>() == 16);
+const _: () = assert!(std::mem::size_of::<IpmiReq>() == 40);
+const _: () = assert!(std::mem::size_of::<IpmiRecv>() == 48);
+const _: () = assert!(std::mem::size_of::<IpmiSystemInterfaceAddr>() == 8);
+
 // ---- 低レベル送受信 ----
 
 /// シリアライズされた IPMI デバイス。send→poll→recv をアトミックに行う。
@@ -117,6 +130,9 @@ impl Device {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
+            // 受信キューが空のとき RECEIVE_MSG がブロックせず
+            // EAGAIN で返るようにする（poll で受信をゲートしている前提）
+            .custom_flags(libc::O_NONBLOCK)
             .open(path)
             .map_err(IpmiError::Io)?;
         Ok(Self { file, msgid: 0 })
@@ -155,10 +171,7 @@ impl Device {
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                return Err(IpmiError::Parse(format!(
-                    "ipmi response timed out after {}s",
-                    REQUEST_TIMEOUT.as_secs()
-                )));
+                return Err(IpmiError::Timeout(REQUEST_TIMEOUT.as_secs()));
             }
             let mut pfd = libc::pollfd {
                 fd: self.file.as_raw_fd(),
@@ -173,8 +186,19 @@ impl Device {
                 }
                 return Err(e.into());
             }
-            if n == 0 || pfd.revents & libc::POLLIN == 0 {
+            if n == 0 {
+                // 期限切れ間際の poll タイムアウト。次の周回で
+                // deadline チェックが抜ける
                 continue;
+            }
+            if pfd.revents & libc::POLLIN == 0 {
+                // POLLERR / POLLHUP / POLLNVAL 等。デバイス異常として
+                // 即エラーにする（busy-spin しない）
+                return Err(std::io::Error::other(format!(
+                    "ipmi device poll error (revents {:#x})",
+                    pfd.revents
+                ))
+                .into());
             }
 
             // 入力側の data_len/addr_len はバッファ容量。
@@ -309,7 +333,8 @@ fn parse_full_sensor(rec: &[u8]) -> Option<FullSensor> {
     Some(FullSensor {
         sensor_num: rec[7],
         sensor_type: rec[12],
-        event_type: rec[13],
+        // bit7 は reserved — 下位7bit のみが event/reading type code
+        event_type: rec[13] & 0x7f,
         analog_fmt: rec[20] >> 6,
         unit_base: rec[21],
         linearization: rec[23],
@@ -361,7 +386,9 @@ fn get_sensor_reading(dev: &mut Device, sensor_num: u8) -> Result<SensorReading>
             if d.len() < 2 {
                 return Err(IpmiError::Parse("short sensor reading".into()));
             }
-            if d[1] & 0x20 != 0 {
+            // bit5 = reading unavailable、bit4 = sensor scanning disabled。
+            // どちらも「値が信用できない」ので欠測扱い
+            if d[1] & 0x30 != 0 {
                 return Ok(SensorReading::Unavailable);
             }
             Ok(SensorReading::Value {
@@ -386,9 +413,19 @@ fn scan_sdr(dev: &mut Device) -> Result<Vec<Vec<u8>>> {
 
         let mut records = Vec::new();
         let mut id: u16 = 0;
+        let mut seen = HashSet::new();
         let mut reservation_lost = false;
 
         while id != 0xffff {
+            // BMC が next_id を誤って返した場合の無限ループ防止。
+            // レコード ID の再訪（自己ループ・循環）と異常に長い
+            // チェーンの両方をここで打ち切る
+            if !seen.insert(id) || seen.len() > MAX_SDR_RECORDS {
+                return Err(IpmiError::Parse(format!(
+                    "sdr record chain broken at id {id:#06x} ({} records)",
+                    records.len()
+                )));
+            }
             // レコードはチャンク読み。ヘッダ5バイトで本体長を確定させる。
             let mut rec = Vec::new();
             let mut next_id = 0xffffu16;
@@ -529,6 +566,12 @@ fn parse_product_area(area: &[u8]) -> Option<String> {
 
 pub struct NativeBackend {
     dev: Arc<Mutex<Device>>,
+    /// パース済み Full Sensor Record のキャッシュ。センサー集合は
+    /// 実行中に変わらない前提で SDR スキャンを1回に抑える
+    /// （ipmitool の sdr キャッシュ相当）。読み取り側が輻輳する
+    /// と `set_pwm`/`clear_override` が遅れるため。
+    /// 読み取り系でトランスポートエラーが起きた場合は invalidate する。
+    sensors: Mutex<Option<Arc<Vec<FullSensor>>>>,
     path: PathBuf,
 }
 
@@ -544,6 +587,7 @@ impl NativeBackend {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         Ok(Self {
             dev: Arc::new(Mutex::new(Device::open(path.as_ref())?)),
+            sensors: Mutex::new(None),
             path: path.as_ref().to_path_buf(),
         })
     }
@@ -579,14 +623,33 @@ impl NativeBackend {
     }
 
     /// SDR を走査して Full Sensor Record を全件パースする。
-    async fn sensors(&self) -> Result<Vec<FullSensor>> {
-        self.run(|d| {
-            Ok(scan_sdr(d)?
-                .iter()
-                .filter_map(|r| parse_full_sensor(r))
-                .collect())
-        })
-        .await
+    /// 成功したスキャン結果はキャッシュされ、各ポーリング周期での
+    /// 全レコード再走査（デバイスロック保持時間）を避ける。
+    async fn sensors(&self) -> Result<Arc<Vec<FullSensor>>> {
+        {
+            let cache = self.sensors.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(s) = cache.as_ref() {
+                return Ok(Arc::clone(s));
+            }
+        }
+        let sensors = Arc::new(
+            self.run(|d| {
+                Ok(scan_sdr(d)?
+                    .iter()
+                    .filter_map(|r| parse_full_sensor(r))
+                    .collect::<Vec<_>>())
+            })
+            .await?,
+        );
+        *self.sensors.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&sensors));
+        Ok(sensors)
+    }
+
+    /// 読み取り系でトランスポートエラーが起きたらセンサーキャッシュを
+    /// 捨て、次回ポーリングで SDR を再走査する（BMC 側のセンサー
+    /// 集合が変化した場合への回復経路）。
+    fn invalidate_sensors(&self) {
+        *self.sensors.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 }
 
@@ -643,73 +706,80 @@ impl FanControlBackend for NativeBackend {
     fn fans(&self) -> impl std::future::Future<Output = Result<Vec<FanReading>>> + Send {
         async move {
             let sensors = self.sensors().await?;
-            let dev = Arc::clone(&self.dev);
-            tokio::task::spawn_blocking(move || {
-                let mut dev = dev
-                    .lock()
-                    .map_err(|_| IpmiError::Parse("device lock poisoned".into()))?;
-                let mut out = Vec::new();
-                for s in sensors.iter().filter(|s| s.sensor_type == SENSOR_TYPE_FAN) {
-                    let reading = match get_sensor_reading(&mut dev, s.sensor_num) {
-                        Ok(SensorReading::Value { raw, thr }) => {
-                            let rpm = linearize(s, raw).map(|v| v.max(0.0) as u32);
-                            // しきい値比較ビットが立っていれば Alarm
-                            let alarm = s.event_type == 0x01 && thr & 0x3f != 0;
-                            let status = if alarm {
-                                FanStatus::Alarm
-                            } else {
-                                FanStatus::Ok
-                            };
-                            FanReading {
-                                name: s.name.clone(),
-                                rpm,
-                                status,
+            let result = self
+                .run(move |dev| {
+                    let mut out = Vec::new();
+                    for s in sensors.iter().filter(|s| s.sensor_type == SENSOR_TYPE_FAN) {
+                        // トランスポート層のエラーは Disabled に潰さず伝播させる。
+                        // ここで Err を返さないとデーモンの fan_failures /
+                        // ipmi_failure_limit フェイルセーフが働かない。
+                        // 値を欠測してよいのは BMC が明示的に返す
+                        // Unavailable（completion code・unavailable bit）だけ。
+                        let reading = match get_sensor_reading(dev, s.sensor_num)? {
+                            SensorReading::Value { raw, thr } => {
+                                let rpm = linearize(s, raw).map(|v| v.max(0.0) as u32);
+                                // しきい値比較ビットが立っていれば Alarm
+                                let alarm = s.event_type == 0x01 && thr & 0x3f != 0;
+                                FanReading {
+                                    name: s.name.clone(),
+                                    rpm,
+                                    status: if alarm {
+                                        FanStatus::Alarm
+                                    } else {
+                                        FanStatus::Ok
+                                    },
+                                }
                             }
-                        }
-                        Ok(SensorReading::Unavailable) | Err(_) => FanReading {
-                            name: s.name.clone(),
-                            rpm: None,
-                            status: FanStatus::Disabled,
-                        },
-                    };
-                    out.push(reading);
-                }
-                Ok(out)
-            })
-            .await
-            .map_err(|e| IpmiError::Parse(format!("join error: {e}")))?
+                            SensorReading::Unavailable => FanReading {
+                                name: s.name.clone(),
+                                rpm: None,
+                                status: FanStatus::Disabled,
+                            },
+                        };
+                        out.push(reading);
+                    }
+                    Ok(out)
+                })
+                .await;
+            if result.is_err() {
+                self.invalidate_sensors();
+            }
+            result
         }
     }
 
     fn temperatures(&self) -> impl std::future::Future<Output = Result<Vec<TempReading>>> + Send {
         async move {
             let sensors = self.sensors().await?;
-            let dev = Arc::clone(&self.dev);
-            tokio::task::spawn_blocking(move || {
-                let mut dev = dev
-                    .lock()
-                    .map_err(|_| IpmiError::Parse("device lock poisoned".into()))?;
-                let mut out = Vec::new();
-                for s in sensors.iter().filter(|s| {
-                    s.sensor_type == SENSOR_TYPE_TEMPERATURE
-                        && (s.unit_base == UNIT_DEGREES_C || s.unit_base == 0)
-                }) {
-                    if let Ok(SensorReading::Value { raw, .. }) =
-                        get_sensor_reading(&mut dev, s.sensor_num)
-                    {
-                        if let Some(c) = linearize(s, raw) {
-                            out.push(TempReading {
-                                chip: "ipmi".into(),
-                                label: s.name.clone(),
-                                celsius: c,
-                            });
+            let result = self
+                .run(move |dev| {
+                    let mut out = Vec::new();
+                    for s in sensors.iter().filter(|s| {
+                        s.sensor_type == SENSOR_TYPE_TEMPERATURE
+                            && (s.unit_base == UNIT_DEGREES_C || s.unit_base == 0)
+                    }) {
+                        // fans() と同様、トランスポートエラーは伝播。
+                        // 欠測として捨ててよいのは Unavailable と
+                        // 非線形センサーだけ
+                        if let SensorReading::Value { raw, .. } =
+                            get_sensor_reading(dev, s.sensor_num)?
+                        {
+                            if let Some(c) = linearize(s, raw) {
+                                out.push(TempReading {
+                                    chip: "ipmi".into(),
+                                    label: s.name.clone(),
+                                    celsius: c,
+                                });
+                            }
                         }
                     }
-                }
-                Ok(out)
-            })
-            .await
-            .map_err(|e| IpmiError::Parse(format!("join error: {e}")))?
+                    Ok(out)
+                })
+                .await;
+            if result.is_err() {
+                self.invalidate_sensors();
+            }
+            result
         }
     }
 

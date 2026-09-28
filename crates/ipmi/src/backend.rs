@@ -17,6 +17,8 @@ pub enum IpmiError {
     Parse(String),
     #[error("IPMI completion code 0x{0:02x}")]
     Completion(u8),
+    #[error("ipmi request timed out after {0}s")]
+    Timeout(u64),
     #[error("operation not supported by this backend")]
     Unsupported,
     #[error(transparent)]

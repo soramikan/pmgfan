@@ -177,11 +177,18 @@ iRMC S5 (KCS システムインターフェース)
 - **SDR**: `Reserve SDR Repository`（0x22）→ `Get SDR`（0x23）で全レコードを
   列挙。ヘッダ5バイトを読んでから `rec[4]` の長さ分だけ継続読み出しする
   （固定サイズで一括読みすると末尾超過で失敗する BMC がある）。
-  予約喪失（0xc5）は再予約して再試行。
+  予約喪失（0xc5）は再予約して再試行。レコード ID の再訪・上限超過は
+  エラーにし、BMC が `next_id` を誤って返してもデバイスロックを握った
+  まま無限巡回しない。パース結果はキャッシュし、ポーリング毎の
+  全レコード再走査を避ける（読み取りエラー時は invalidate）。
 - **センサー変換**: Full Sensor Record（type 0x01）のみパースし、
   `Get Sensor Reading`（0x2d）の生値を `y = (M·x + B·10^Bexp) · 10^Rexp`
   で線形化。ファンは sensor type 0x04、温度は 0x01。非線形
-  （linearization ≠ 0）や reading-unavailable は `rpm: None` / 不可扱いにする。
+  （linearization ≠ 0）や reading-unavailable / scanning-disabled は
+  `rpm: None` / 欠測扱いにする。一方、トランスポート層エラー
+  （IO・タイムアウト・形式不正）は `Err` で伝播し、`Disabled` に
+  潰さない — デーモンの `ipmi_failure_limit` フェイルセーフが
+  正しくカウントできるようにするため。
 - **OEM 制御**: `fujitsu::*_data()` のペイロードをそのまま
   netfn 0x2e / cmd 0xf5 に流す。ipmitool backend と完全に共通。
 

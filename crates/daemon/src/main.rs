@@ -292,21 +292,21 @@ fn build_params(
     if config.device.model.trim().is_empty() {
         bail!("[device] model must not be empty");
     }
-    // 空 interface だと `ipmitool -I ""` になる
-    if config.device.interface.trim().is_empty() {
-        bail!("[device] interface must not be empty");
-    }
-    if !matches!(
-        config.device.backend.as_str(),
-        "ipmitool" | "native" | "openipmi"
-    ) {
-        bail!(
-            "[device] backend '{}' is not supported (\"ipmitool\" or \"native\")",
-            config.device.backend
-        );
-    }
-    if config.device.path.trim().is_empty() {
-        bail!("[device] path must not be empty");
+    // バックエンドが使わないキー（ipmitool なら path、native なら
+    // interface）は検証しない
+    match config.device.backend.as_str() {
+        "ipmitool" => {
+            // 空 interface だと `ipmitool -I ""` になる
+            if config.device.interface.trim().is_empty() {
+                bail!("[device] interface must not be empty");
+            }
+        }
+        "native" | "openipmi" => {
+            if config.device.path.trim().is_empty() {
+                bail!("[device] path must not be empty");
+            }
+        }
+        other => bail!("[device] backend '{other}' is not supported (\"ipmitool\" or \"native\")"),
     }
     for (key, v) in [
         ("cpu_emergency", config.safety.cpu_emergency),
