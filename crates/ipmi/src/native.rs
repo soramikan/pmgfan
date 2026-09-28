@@ -41,6 +41,13 @@ const MAX_SDR_RECORDS: usize = 1024;
 /// ポーリング毎に失敗としてカウントしないよう短いバックオフで再試行する。
 const SEND_RETRIES: u32 = 5;
 const SEND_RETRY_DELAY: Duration = Duration::from_millis(20);
+/// IPMI メッセージのカーネル上限（`IPMI_MAX_MSG_LENGTH`）。
+const IPMI_MAX_MSG_LENGTH: usize = 272;
+/// FRU デバイス探索の上限 ID。
+const MAX_FRU_DEVICES: u8 = 8;
+/// パース済み SDR センサー一覧のキャッシュ寿命。BMC FW 更新や
+/// PSU 増設などでセンサー集合が変わった場合の自動追従用。
+const SENSOR_CACHE_TTL: Duration = Duration::from_secs(300);
 
 const NETFN_SENSOR: u8 = 0x04;
 const NETFN_APP: u8 = 0x06;
@@ -139,6 +146,20 @@ struct Device {
     msgid: i64,
 }
 
+/// IPMI 要求を1回送受信する最小トランスポート。
+/// `Device`（/dev/ipmi0 ioctl）とテスト用モックが実装する。
+trait Transport {
+    /// completion code 剥がし済みの応答データを返す。
+    /// cc != 0 は `IpmiError::Completion`。
+    fn request(&mut self, netfn: u8, cmd: u8, data: &[u8]) -> Result<Vec<u8>>;
+}
+
+impl Transport for Device {
+    fn request(&mut self, netfn: u8, cmd: u8, data: &[u8]) -> Result<Vec<u8>> {
+        Device::request(self, netfn, cmd, data)
+    }
+}
+
 impl Device {
     fn open(path: &Path) -> Result<Self> {
         let file = OpenOptions::new()
@@ -155,8 +176,8 @@ impl Device {
     /// netfn/cmd/data で1要求を送り、completion code を剥がした
     /// 応答データを返す。cc != 0 は `IpmiError::Completion`。
     fn request(&mut self, netfn: u8, cmd: u8, data: &[u8]) -> Result<Vec<u8>> {
-        if data.len() > u16::MAX as usize {
-            // ipmi_msg.data_len は u16。超過は静音切り詰めにせず拒否する
+        if data.len() > IPMI_MAX_MSG_LENGTH {
+            // カーネル側のメッセージ長上限。超過は静音切り詰めにせず拒否する
             return Err(IpmiError::Parse("ipmi request payload too large".into()));
         }
         self.msgid = self.msgid.wrapping_add(1);
@@ -187,6 +208,9 @@ impl Device {
                 break;
             }
             let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
             if e.raw_os_error() == Some(libc::EAGAIN) && send_attempts < SEND_RETRIES {
                 send_attempts += 1;
                 std::thread::sleep(SEND_RETRY_DELAY);
@@ -250,6 +274,7 @@ impl Device {
             if r < 0 {
                 let e = std::io::Error::last_os_error();
                 match e.raw_os_error() {
+                    Some(libc::EINTR) => continue,
                     // キューが空（前のポーリングで通知済みのメッセージを
                     // 別メッセージが先に使い切った等）
                     Some(libc::EAGAIN) => {
@@ -268,7 +293,8 @@ impl Device {
                     // 受信バッファに収まらないメッセージはキューに残り、
                     // 以降の受信が EMSGSIZE を返し続けるので
                     // TRUNC 版で読み捨てて回復する。
-                    // （data_buf=512B > IPMI 最大応答長 255B のため通常は到達しない）
+                    // （data_buf=512B > IPMI_MAX_MSG_LENGTH(272B) のため
+                    //   通常は到達しない）
                     Some(libc::EMSGSIZE) => {
                         let mut drop_recv = IpmiRecv {
                             recv_type: 0,
@@ -476,17 +502,26 @@ fn parse_sensor_reading(d: &[u8]) -> Result<SensorReading> {
     })
 }
 
-fn get_sensor_reading(dev: &mut Device, sensor_num: u8) -> Result<SensorReading> {
+fn get_sensor_reading(dev: &mut impl Transport, sensor_num: u8) -> Result<SensorReading> {
     match dev.request(NETFN_SENSOR, CMD_GET_SENSOR_READING, &[sensor_num]) {
         Ok(d) => parse_sensor_reading(&d),
-        Err(IpmiError::Completion(_)) => Ok(SensorReading::Unavailable),
+        // 「このセンサーに読み取り値が存在しない」ことを意味する
+        // completion code のみ欠測扱いにする:
+        //   0xcb = requested sensor/data/record not present
+        //   0xcd = command illegal for this sensor/record type
+        // それ以外（0xc0 busy, 0xc1 invalid cmd, 0xc3 timeout, 0xff 等の
+        // 障害系）は Err 伝播 — 全センサーが Disabled に見えても
+        // poll_fans_loop が成功扱いし ipmi_failure_limit が働かない
+        // 状態を防ぐ。実機観測: 不在ファンは cc ではなく status byte の
+        // unavailable ビット（0xa0）で返る。
+        Err(IpmiError::Completion(0xcb | 0xcd)) => Ok(SensorReading::Unavailable),
         Err(e) => Err(e),
     }
 }
 
 /// SDR リポジトリを走査して全レコードのバイト列を返す。
 /// 予約 ID の無効化（別エージェントの介入）に備えてリトライする。
-fn scan_sdr(dev: &mut Device) -> Result<Vec<Vec<u8>>> {
+fn scan_sdr(dev: &mut impl Transport) -> Result<Vec<Vec<u8>>> {
     for _ in 0..SCAN_RETRIES {
         let resv = dev.request(NETFN_STORAGE, CMD_RESERVE_SDR, &[])?;
         if resv.len() < 2 {
@@ -591,7 +626,12 @@ fn scan_sdr(dev: &mut Device) -> Result<Vec<Vec<u8>>> {
 // ---- FRU ----
 
 /// FRU の `offset` から `want` バイト読む。実際に返ったバイト列を返す。
-fn read_fru_chunk(dev: &mut Device, fru_id: u8, offset: usize, want: u8) -> Result<Vec<u8>> {
+fn read_fru_chunk(
+    dev: &mut impl Transport,
+    fru_id: u8,
+    offset: usize,
+    want: u8,
+) -> Result<Vec<u8>> {
     let req = [fru_id, (offset & 0xff) as u8, (offset >> 8) as u8, want];
     let d = dev.request(NETFN_STORAGE, CMD_READ_FRU_DATA, &req)?;
     if d.is_empty() {
@@ -604,7 +644,7 @@ fn read_fru_chunk(dev: &mut Device, fru_id: u8, offset: usize, want: u8) -> Resu
 /// FRU デバイスの Product Info Area から Product Name を読む。
 /// 全域を読まず common header → product area のみに絞る
 /// （エリアが大きい FRU では数十KBの転送になるのを避ける）。
-fn fru_product_name(dev: &mut Device, fru_id: u8) -> Result<Option<String>> {
+fn fru_product_name(dev: &mut impl Transport, fru_id: u8) -> Result<Option<String>> {
     // サイズ取得はデバイス存在確認も兼ねる（不在なら cc!=0 で Err）
     let info = dev.request(NETFN_STORAGE, CMD_GET_FRU_AREA_INFO, &[fru_id])?;
     if info.len() < 2 {
@@ -655,16 +695,40 @@ fn parse_product_area(area: &[u8]) -> Option<String> {
     None
 }
 
+/// FRU デバイスを順に探し、最初に Product Name が取れたものを返す
+/// （TX1320 M4 では FRU 2 = Chassis）。
+/// 不在 FRU の completion error だけを許容して走査継続。
+/// Io/Timeout/Parse は BMC 障害なので即失敗 — 全 FRU ×
+/// タイムアウトを待って起動が数十秒遅れるのを防ぐ。
+fn first_product_name(d: &mut impl Transport) -> Result<String> {
+    let mut last_err = None;
+    let mut any_ok = false;
+    for fru_id in 0..MAX_FRU_DEVICES {
+        match fru_product_name(d, fru_id) {
+            Ok(Some(name)) => return Ok(name),
+            Ok(None) => any_ok = true,
+            Err(e @ IpmiError::Completion(_)) => last_err = Some(e),
+            Err(e) => return Err(e),
+        }
+    }
+    if any_ok {
+        return Err(IpmiError::Parse("no FRU product name found".into()));
+    }
+    match last_err {
+        Some(e) => Err(e),
+        None => Err(IpmiError::Parse("no FRU product name found".into())),
+    }
+}
+
 // ---- バックエンド ----
 
 pub struct NativeBackend {
     dev: Arc<Mutex<Device>>,
-    /// パース済み Full Sensor Record のキャッシュ。センサー集合は
-    /// 実行中に変わらない前提で SDR スキャンを1回に抑える
-    /// （ipmitool の sdr キャッシュ相当）。読み取り側が輻輳する
-    /// と `set_pwm`/`clear_override` が遅れるため。
-    /// 読み取り系でトランスポートエラーが起きた場合は invalidate する。
-    sensors: Mutex<Option<Arc<Vec<FullSensor>>>>,
+    /// パース済み Full Sensor Record のキャッシュ（取得時刻つき）。
+    /// ポーリング毎の全レコード再走査（デバイスロック保持時間）を避ける。
+    /// SENSOR_CACHE_TTL 経過か読み取りエラーで再スキャンする
+    /// （PSU 増設・BMC FW 更新への追従経路）。
+    sensors: Mutex<Option<(Arc<Vec<FullSensor>>, Instant)>>,
     path: PathBuf,
 }
 
@@ -693,9 +757,10 @@ impl NativeBackend {
     {
         let dev = Arc::clone(&self.dev);
         tokio::task::spawn_blocking(move || {
-            let mut dev = dev
-                .lock()
-                .map_err(|_| IpmiError::Parse("device lock poisoned".into()))?;
+            // ポイズン時も回復する — クロージャのパニックがあっても
+            // Device の ioctl 整合状態（msgid・受信キュー照合）は
+            // 壊れないため、以後永久に IPMI 不能になる必要はない
+            let mut dev = dev.lock().unwrap_or_else(|e| e.into_inner());
             f(&mut dev)
         })
         .await
@@ -718,11 +783,14 @@ impl NativeBackend {
     /// SDR を走査して Full Sensor Record を全件パースする。
     /// 成功したスキャン結果はキャッシュされ、各ポーリング周期での
     /// 全レコード再走査（デバイスロック保持時間）を避ける。
+    /// TTL 経過後は再走査する。
     async fn sensors(&self) -> Result<Arc<Vec<FullSensor>>> {
         {
             let cache = self.sensors.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(s) = cache.as_ref() {
-                return Ok(Arc::clone(s));
+            if let Some((s, ts)) = cache.as_ref() {
+                if ts.elapsed() < SENSOR_CACHE_TTL {
+                    return Ok(Arc::clone(s));
+                }
             }
         }
         let sensors = Arc::new(
@@ -734,7 +802,8 @@ impl NativeBackend {
             })
             .await?,
         );
-        *self.sensors.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&sensors));
+        *self.sensors.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((Arc::clone(&sensors), Instant::now()));
         Ok(sensors)
     }
 
@@ -775,32 +844,7 @@ impl DeviceId {
 
 impl FanControlBackend for NativeBackend {
     fn model_name(&self) -> impl std::future::Future<Output = Result<String>> + Send {
-        async move {
-            self.run(|d| {
-                // FRU デバイスを順に探し、最初に Product Name が
-                // 取れたものを返す（TX1320 M4 では FRU 2 = Chassis）。
-                // 存在しない FRU の completion error は last_err に
-                // 上書きされ続けるので、「読めた FRU はあるが name が
-                // 無い」場合と「全 FRU が応答しない」場合を分ける。
-                let mut last_err = None;
-                let mut any_ok = false;
-                for fru_id in 0..8u8 {
-                    match fru_product_name(d, fru_id) {
-                        Ok(Some(name)) => return Ok(name),
-                        Ok(None) => any_ok = true,
-                        Err(e) => last_err = Some(e),
-                    }
-                }
-                if any_ok {
-                    return Err(IpmiError::Parse("no FRU product name found".into()));
-                }
-                match last_err {
-                    Some(e) => Err(e),
-                    None => Err(IpmiError::Parse("no FRU product name found".into())),
-                }
-            })
-            .await
-        }
+        async move { self.run(first_product_name).await }
     }
 
     fn fans(&self) -> impl std::future::Future<Output = Result<Vec<FanReading>>> + Send {
@@ -809,7 +853,10 @@ impl FanControlBackend for NativeBackend {
             let result = self
                 .run(move |dev| {
                     let mut out = Vec::new();
-                    for s in sensors.iter().filter(|s| s.sensor_type == SENSOR_TYPE_FAN) {
+                    for s in sensors
+                        .iter()
+                        .filter(|s| s.sensor_type == SENSOR_TYPE_FAN && !s.name.is_empty())
+                    {
                         // トランスポート層のエラーは Disabled に潰さず伝播させる。
                         // ここで Err を返さないとデーモンの fan_failures /
                         // ipmi_failure_limit フェイルセーフが働かない。
@@ -817,16 +864,24 @@ impl FanControlBackend for NativeBackend {
                         // Unavailable（completion code・unavailable bit）だけ。
                         let reading = match get_sensor_reading(dev, s.sensor_num)? {
                             SensorReading::Value { raw, thr } => {
-                                let rpm = linearize(s, raw).map(|v| v.max(0.0) as u32);
                                 // しきい値比較ビットが立っていれば Alarm
                                 let alarm = s.event_type == 0x01 && thr & 0x3f != 0;
-                                FanReading {
-                                    name: s.name.clone(),
-                                    rpm,
-                                    status: if alarm {
-                                        FanStatus::Alarm
-                                    } else {
-                                        FanStatus::Ok
+                                match linearize(s, raw) {
+                                    Some(v) => FanReading {
+                                        name: s.name.clone(),
+                                        rpm: Some(v.max(0.0) as u32),
+                                        status: if alarm {
+                                            FanStatus::Alarm
+                                        } else {
+                                            FanStatus::Ok
+                                        },
+                                    },
+                                    // 非線形/非アナログは値を信用できない
+                                    // ので欠測（ipmitool の ns 相当）
+                                    None => FanReading {
+                                        name: s.name.clone(),
+                                        rpm: None,
+                                        status: FanStatus::Disabled,
                                     },
                                 }
                             }
@@ -856,7 +911,10 @@ impl FanControlBackend for NativeBackend {
                     let mut out = Vec::new();
                     for s in sensors.iter().filter(|s| {
                         s.sensor_type == SENSOR_TYPE_TEMPERATURE
-                            && (s.unit_base == UNIT_DEGREES_C || s.unit_base == 0)
+                            // unit が °C 以外（°F=0x02 等）のセンサーは
+                            // 値をそのまま °C として扱えないので除外
+                            && s.unit_base == UNIT_DEGREES_C
+                            && !s.name.is_empty()
                     }) {
                         // fans() と同様、トランスポートエラーは伝播。
                         // 欠測として捨ててよいのは Unavailable と
@@ -937,12 +995,13 @@ mod tests {
 
     /// 実機 (TX1320 M4) の `sdr dump` から取得した FAN CPU の Full Sensor Record。
     /// M=25, B=0, exps=0 → rpm = raw * 25。raw=125 → 3125 RPM。
+    /// （宣言長 rec[4]=0x3b → 計64B、末尾は BMC の 0 パディング）
     const REC_FAN_CPU: &[u8] = &[
         0x19, 0x00, 0x51, 0x01, 0x3b, 0x20, 0x00, 0x19, 0x1d, 0x00, 0x3b, 0x54, 0x04, 0x01, 0x00,
         0x20, 0x00, 0x00, 0x02, 0x02, 0x20, 0x12, 0x00, 0x00, 0x19, 0x01, 0x00, 0x01, 0x00, 0x00,
         0x00, 0x00, 0x00, 0x00, 0xff, 0x00, 0xff, 0xff, 0xff, 0x00, 0x18, 0x00, 0x00, 0x04, 0x00,
         0x00, 0x81, 0xc7, 0x46, 0x41, 0x4e, 0x20, 0x43, 0x50, 0x55, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
     ];
 
     /// Ambient 温度: M=25, B=0, R_exp=-2 → celsius = raw * 25 / 100。
@@ -952,7 +1011,7 @@ mod tests {
         0x32, 0x85, 0x32, 0x1b, 0x1b, 0x00, 0x01, 0x00, 0x00, 0x19, 0x00, 0x00, 0x00, 0x00, 0xe0,
         0x00, 0x00, 0x00, 0x00, 0xff, 0x00, 0x00, 0xc0, 0xb8, 0x00, 0x04, 0x10, 0x07, 0x03, 0x00,
         0x00, 0x00, 0xc7, 0x41, 0x6d, 0x62, 0x69, 0x65, 0x6e, 0x74, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
     ];
 
     /// FAN PSU1: M=80 → rpm = raw * 80。raw=47 → 3760 RPM。
@@ -961,7 +1020,7 @@ mod tests {
         0x20, 0x00, 0x00, 0x02, 0x02, 0x20, 0x12, 0x00, 0x00, 0x50, 0x01, 0x00, 0x01, 0x00, 0x00,
         0x00, 0x00, 0x00, 0x00, 0xff, 0x00, 0xff, 0xff, 0xff, 0x00, 0x0c, 0x00, 0x00, 0x04, 0x00,
         0x00, 0x81, 0xc8, 0x46, 0x41, 0x4e, 0x20, 0x50, 0x53, 0x55, 0x31, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
     ];
 
     #[test]
@@ -1111,5 +1170,152 @@ mod tests {
         assert_eq!(id.product_id, 0x0501);
         assert_eq!(id.fw_major, 0x03);
         assert_eq!(id.fw_minor, 0x31);
+    }
+
+    // ---- mock transport ----
+
+    /// 要求を逐一出しで応答するスクリプト済みトランスポート。
+    /// completion code は Device::request が剥がすので、ここでは
+    /// `Err(IpmiError::Completion)` として直接スクリプトする。
+    struct MockTransport {
+        script: std::collections::VecDeque<(u8, u8, Result<Vec<u8>>)>,
+        log: Vec<(u8, u8, Vec<u8>)>,
+    }
+
+    impl MockTransport {
+        fn new() -> Self {
+            Self {
+                script: std::collections::VecDeque::new(),
+                log: Vec::new(),
+            }
+        }
+        fn respond(mut self, netfn: u8, cmd: u8, data: &[u8]) -> Self {
+            self.script.push_back((netfn, cmd, Ok(data.to_vec())));
+            self
+        }
+        fn fail(mut self, netfn: u8, cmd: u8, e: IpmiError) -> Self {
+            self.script.push_back((netfn, cmd, Err(e)));
+            self
+        }
+        /// 全スクリプトを消費したか確認する
+        fn assert_done(&self) {
+            assert!(self.script.is_empty(), "unconsumed script entries");
+        }
+    }
+
+    impl Transport for MockTransport {
+        fn request(&mut self, netfn: u8, cmd: u8, data: &[u8]) -> Result<Vec<u8>> {
+            self.log.push((netfn, cmd, data.to_vec()));
+            let (en, ec, resp) = self
+                .script
+                .pop_front()
+                .unwrap_or_else(|| panic!("unexpected request {netfn:#x}/{cmd:#x}"));
+            assert_eq!((netfn, cmd), (en, ec), "request mismatch");
+            resp
+        }
+    }
+
+    /// Get SDR 応答 = [next_id lo, next_id hi, ...record bytes]
+    fn sdr_resp(next_id: u16, rec: &[u8]) -> Vec<u8> {
+        let mut v = vec![next_id as u8, (next_id >> 8) as u8];
+        v.extend_from_slice(rec);
+        v
+    }
+
+    #[test]
+    fn sensor_reading_completion_whitelist() {
+        // 実機確認済み: 不在センサーは 0xcb、不在センサー領域は 0xcd。
+        // これらだけが Unavailable で、それ以外の completion code は
+        // 全て伝播（0xcb 丸め込みはしない）
+        for code in [0xcb, 0xcd] {
+            let mut t = MockTransport::new().fail(0x04, 0x2d, IpmiError::Completion(code));
+            assert!(matches!(
+                get_sensor_reading(&mut t, 1),
+                Ok(SensorReading::Unavailable)
+            ));
+        }
+        for code in [0xc0, 0xc1, 0xc3, 0xd4, 0xff] {
+            let mut t = MockTransport::new().fail(0x04, 0x2d, IpmiError::Completion(code));
+            assert!(
+                matches!(get_sensor_reading(&mut t, 1), Err(IpmiError::Completion(c)) if c == code)
+            );
+        }
+    }
+
+    #[test]
+    fn scan_sdr_detects_id_cycle() {
+        // BMC が next_id = id (自己ループ) を返す異常系:
+        // デバイスロックを握ったまま無限巡回しないことを検証
+        let rec = REC_FAN_CPU;
+        let mut t = MockTransport::new()
+            // Reserve SDR → reservation id 0x0001
+            .respond(0x0a, 0x22, &[0x01, 0x00])
+            // id=0 レコード: header + body、next=0x0005
+            .respond(0x0a, 0x23, &sdr_resp(0x0005, &rec[..5]))
+            .respond(0x0a, 0x23, &sdr_resp(0x0005, &rec[5..]))
+            // id=5 レコード: next=0x0005 (自身) → 循環検出
+            .respond(0x0a, 0x23, &sdr_resp(0x0005, &rec[..5]))
+            .respond(0x0a, 0x23, &sdr_resp(0x0005, &rec[5..]));
+        let err = scan_sdr(&mut t).unwrap_err();
+        assert!(err.to_string().contains("chain broken"), "{err}");
+    }
+
+    #[test]
+    fn scan_sdr_terminates_at_ffff() {
+        let rec = REC_FAN_CPU;
+        let mut t = MockTransport::new()
+            .respond(0x0a, 0x22, &[0x01, 0x00])
+            .respond(0x0a, 0x23, &sdr_resp(0xffff, &rec[..5]))
+            .respond(0x0a, 0x23, &sdr_resp(0xffff, &rec[5..]));
+        let records = scan_sdr(&mut t).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].len(), rec.len());
+        t.assert_done();
+    }
+
+    #[test]
+    fn first_product_name_skips_absent_fru() {
+        // fru 0/1 は不在 (0xcb)、fru 2 で product name を返す。
+        // product area: [ver, len×8, lang, field0=manufacturer "FJD",
+        // field1=product name "TX132", 0xc1 end, pad, chk]
+        let mut area = vec![0u8; 24];
+        area[0] = 0x01;
+        area[1] = 0x03; // 24 bytes
+        area[2] = 0x00;
+        area[3] = 0xc3;
+        area[4..7].copy_from_slice(b"FJD");
+        area[7] = 0xc5;
+        area[8..13].copy_from_slice(b"TX132");
+        area[13] = 0xc1;
+        let chk = area.iter().skip(2).fold(0u8, |a, &b| a.wrapping_add(b));
+        area[23] = 0u8.wrapping_sub(chk);
+        // common header: [0x01, 0,0,0, product=1(x8B), 0, 0, chk]
+        let hdr = [0x01u8, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0xfe];
+        let mut area_read = vec![area.len() as u8];
+        area_read.extend_from_slice(&area);
+        let mut hdr_read = vec![hdr.len() as u8];
+        hdr_read.extend_from_slice(&hdr);
+
+        let mut t = MockTransport::new()
+            .fail(0x0a, 0x10, IpmiError::Completion(0xcb)) // fru 0
+            .fail(0x0a, 0x10, IpmiError::Completion(0xcb)) // fru 1
+            .respond(0x0a, 0x10, &[0x20, 0x00, 0x00]) // fru 2: size 32
+            .respond(0x0a, 0x11, &hdr_read) // common header @0
+            .respond(0x0a, 0x11, &[0x03, 0x01, 0x03, 0x00]) // area hdr @8
+            .respond(0x0a, 0x11, &area_read); // product area @8
+        assert_eq!(first_product_name(&mut t).unwrap(), "TX132");
+        t.assert_done();
+    }
+
+    #[test]
+    fn first_product_name_propagates_transport_error() {
+        // Io は不在 FRU とは区別して即失敗（走査を続けない）
+        let mut t = MockTransport::new().fail(
+            0x0a,
+            0x10,
+            IpmiError::Io(std::io::Error::from_raw_os_error(libc::EIO)),
+        );
+        assert!(matches!(first_product_name(&mut t), Err(IpmiError::Io(_))));
+        t.assert_done();
     }
 }

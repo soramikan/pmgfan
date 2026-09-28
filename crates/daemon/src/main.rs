@@ -41,7 +41,7 @@ struct Cli {
     /// ipmitool -I のインターフェース（未指定時は config [device] interface → "open"）
     #[arg(short = 'I', long, global = true)]
     interface: Option<String>,
-    /// バックエンド（ipmitool | native。未指定時は config [device] backend）
+    /// バックエンド（ipmitool | native | openipmi。未指定時は config [device] backend）
     #[arg(long, global = true)]
     backend: Option<String>,
     /// native バックエンドの IPMI デバイスパス（未指定時は config [device] path）
@@ -230,7 +230,9 @@ fn build_backend(cli: &Cli, dev: &DeviceConfig) -> Result<Backend> {
                 .map(Backend::Native)
                 .with_context(|| format!("cannot open IPMI device {}", path.display()))
         }
-        other => bail!("unknown [device] backend '{other}' (expected \"ipmitool\" or \"native\")"),
+        other => {
+            bail!("unknown [device] backend '{other}' (expected \"ipmitool\", \"native\", or \"openipmi\")")
+        }
     }
 }
 
@@ -312,7 +314,9 @@ fn build_params(
                 bail!("[device] path must not be empty");
             }
         }
-        other => bail!("[device] backend '{other}' is not supported (\"ipmitool\" or \"native\")"),
+        other => {
+            bail!("[device] backend '{other}' is not supported (\"ipmitool\", \"native\", or \"openipmi\")")
+        }
     }
     for (key, v) in [
         ("cpu_emergency", config.safety.cpu_emergency),

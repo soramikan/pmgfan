@@ -143,7 +143,11 @@ Type=notify
 ExecStart=/usr/sbin/pmgfand \
     --config /etc/pmgfand/config.toml
 
-ExecStopPost=/usr/sbin/pmgfand clear-override
+# ExecStart と同じバックエンドで解除する
+ExecStopPost=/usr/sbin/pmgfand --config /etc/pmgfand/config.toml clear-override
+# config が削除/破損していても動く最後の砦（config を読まない）
+ExecStopPost=-/usr/sbin/pmgfand --backend native --device /dev/ipmi0 clear-override
+ExecStopPost=-/usr/sbin/pmgfand --backend ipmitool -I open clear-override
 
 Restart=on-failure
 RestartSec=2s
@@ -177,5 +181,11 @@ iRMC Auto
 ```
 
 へ戻せる。
+
+`ExecStopPost` は複数行を順に実行し、先行の失敗で後続が止まらない。
+先頭の `--config` 経由は ExecStart と同じバックエンドで解除するが、
+config が起動後に削除・破損するとそれ自体が失敗するため、
+config を一切読まない明示フラグ（`--backend`/`--device`/`-I`）の
+フォールバックを2系統用意してある（解除は冪等で多重実行も無害）。
 
 リポジトリ内の雛形は [../systemd/pmgfand.service](../systemd/pmgfand.service)。

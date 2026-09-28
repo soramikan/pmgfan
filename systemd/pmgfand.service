@@ -11,6 +11,12 @@ ExecStart=/usr/sbin/pmgfand \
 # （[device] backend = "native" 時も正しく ipmitool 非依存で解除できる）
 ExecStopPost=/usr/sbin/pmgfand --config /etc/pmgfand/config.toml clear-override
 
+# 最後の砦: config が削除/破損していると上の行自体が失敗する。
+# 設定を読まない明示フラグで両バックエンドの解除を試みる。
+# ExecStopPost は先行コマンドの失敗後も順に実行される。
+ExecStopPost=-/usr/sbin/pmgfand --backend native --device /dev/ipmi0 clear-override
+ExecStopPost=-/usr/sbin/pmgfand --backend ipmitool -I open clear-override
+
 Restart=on-failure
 RestartSec=2s
 

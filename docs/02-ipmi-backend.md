@@ -168,7 +168,11 @@ iRMC S5 (KCS システムインターフェース)
   （addr_type `0x0c`, channel `0x0f`）宛に送信し、`poll` + `IPMICTL_RECEIVE_MSG`
   で msgid/netfn/cmd を照合して応答を受け取る。
   **受信時は `addr_len` と `msg.data_len` にバッファ容量を設定して渡すこと**
-  （0 のまま渡すと `EMSGSIZE` になる）。
+  （0 のまま渡すと `EMSGSIZE` になる）。デバイスは `O_NONBLOCK` で開き、
+  `poll` が `POLLERR`/`POLLHUP`/`POLLNVAL` を返したら即エラー。
+  それでも `EMSGSIZE` が来た場合（応答が受信バッファより大きい）は
+  `IPMICTL_RECEIVE_MSG_TRUNC` で残りを読み捨ててキューを回復させる
+  — 置き去りにすると以後の全要求が別メッセージの応答で汚染される。
 - **機種検証**: `Get Device ID`（netfn 0x06 cmd 0x01）で Manufacturer/Product ID を
   取得し、FRU を `Get FRU Inventory Area Info`（0x10）で列挙 →
   common header → Product Info Area を読み Product Name を抽出する。
@@ -177,18 +181,27 @@ iRMC S5 (KCS システムインターフェース)
 - **SDR**: `Reserve SDR Repository`（0x22）→ `Get SDR`（0x23）で全レコードを
   列挙。ヘッダ5バイトを読んでから `rec[4]` の長さ分だけ継続読み出しする
   （固定サイズで一括読みすると末尾超過で失敗する BMC がある）。
-  予約喪失（0xc5）は再予約して再試行。レコード ID の再訪・上限超過は
-  エラーにし、BMC が `next_id` を誤って返してもデバイスロックを握った
-  まま無限巡回しない。パース結果はキャッシュし、ポーリング毎の
-  全レコード再走査を避ける（読み取りエラー時は invalidate）。
+  `Get SDR` の offset は u8 なので 255 を超える位置は要求できない
+  — offset=255 では残量全てを一度に要求し、レコードは仕様上限の
+  260B（5+255）まで読める。予約喪失（0xc5）は再予約して再試行。
+  レコード ID の再訪・上限超過（1024）はエラーにし、BMC が `next_id`
+  を誤って返してもデバイスロックを握ったまま無限巡回しない。
+  パース結果は TTL（300s）付きでキャッシュし、ポーリング毎の
+  全レコード再走査を避ける（読み取りエラー時も invalidate）。
 - **センサー変換**: Full Sensor Record（type 0x01）のみパースし、
   `Get Sensor Reading`（0x2d）の生値を `y = (M·x + B·10^Bexp) · 10^Rexp`
-  で線形化。ファンは sensor type 0x04、温度は 0x01。非線形
-  （linearization ≠ 0）や reading-unavailable / scanning-disabled は
-  `rpm: None` / 欠測扱いにする。一方、トランスポート層エラー
-  （IO・タイムアウト・形式不正）は `Err` で伝播し、`Disabled` に
-  潰さない — デーモンの `ipmi_failure_limit` フェイルセーフが
-  正しくカウントできるようにするため。
+  で線形化。ファンは sensor type 0x04、温度は 0x01（unit が °C=0x01
+  以外の温度センサーは除外）。応答 flags byte（Table 35-15）は
+  bit7=events enabled / bit6=scanning enabled / bit5=reading
+  unavailable。scanning disabled（bit6=0）はラッチ済みの古い値なので
+  欠測扱い。非線形（linearization ≠ 0）も欠測扱い。
+  `Get Sensor Reading` が返す completion code で欠測に写すのは
+  実機確認済みの `0xcb`（sensor 不在）と `0xcd`（領域不在）だけ
+  — それ以外（0xc0 busy / 0xc1 invalid / 0xc3 timeout / 0xd4 privilege /
+  0xff 等）は全て `Err` で伝播する。同様にトランスポート層エラー
+  （IO・タイムアウト・形式不正）も `Disabled` に潰さず `Err` —
+  デーモンの `ipmi_failure_limit` フェイルセーフが正しく
+  カウントできるようにするため。
 - **OEM 制御**: `fujitsu::*_data()` のペイロードをそのまま
   netfn 0x2e / cmd 0xf5 に流す。ipmitool backend と完全に共通。
 
