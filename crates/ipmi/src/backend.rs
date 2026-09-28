@@ -15,6 +15,8 @@ pub enum IpmiError {
     Command { cmd: String, stderr: String },
     #[error("unexpected ipmitool output: {0}")]
     Parse(String),
+    #[error("IPMI completion code 0x{0:02x}")]
+    Completion(u8),
     #[error("operation not supported by this backend")]
     Unsupported,
     #[error(transparent)]
@@ -70,4 +72,84 @@ pub trait FanControlBackend {
         &self,
         indices: &[u8],
     ) -> impl std::future::Future<Output = Result<Vec<PwmSlot>>> + Send;
+}
+
+/// 設定で選べるバックエンド実装。
+/// `native` は `/dev/ipmi0` を ioctl で直接駆動し、`ipmitool` は
+/// 従来どおり外部コマンド経由。
+pub enum Backend {
+    Ipmitool(crate::ipmitool::IpmitoolBackend),
+    Native(crate::native::NativeBackend),
+}
+
+impl std::fmt::Debug for Backend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ipmitool(b) => b.fmt(f),
+            Self::Native(b) => b.fmt(f),
+        }
+    }
+}
+
+impl FanControlBackend for Backend {
+    fn model_name(&self) -> impl std::future::Future<Output = Result<String>> + Send {
+        async move {
+            match self {
+                Self::Ipmitool(b) => b.model_name().await,
+                Self::Native(b) => b.model_name().await,
+            }
+        }
+    }
+
+    fn fans(&self) -> impl std::future::Future<Output = Result<Vec<FanReading>>> + Send {
+        async move {
+            match self {
+                Self::Ipmitool(b) => b.fans().await,
+                Self::Native(b) => b.fans().await,
+            }
+        }
+    }
+
+    fn temperatures(&self) -> impl std::future::Future<Output = Result<Vec<TempReading>>> + Send {
+        async move {
+            match self {
+                Self::Ipmitool(b) => b.temperatures().await,
+                Self::Native(b) => b.temperatures().await,
+            }
+        }
+    }
+
+    fn set_pwm(
+        &self,
+        scope: PwmScope,
+        pwm: u8,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        async move {
+            match self {
+                Self::Ipmitool(b) => b.set_pwm(scope, pwm).await,
+                Self::Native(b) => b.set_pwm(scope, pwm).await,
+            }
+        }
+    }
+
+    fn clear_override(&self) -> impl std::future::Future<Output = Result<()>> + Send {
+        async move {
+            match self {
+                Self::Ipmitool(b) => b.clear_override().await,
+                Self::Native(b) => b.clear_override().await,
+            }
+        }
+    }
+
+    fn read_override_slots(
+        &self,
+        indices: &[u8],
+    ) -> impl std::future::Future<Output = Result<Vec<PwmSlot>>> + Send {
+        async move {
+            match self {
+                Self::Ipmitool(b) => b.read_override_slots(indices).await,
+                Self::Native(b) => b.read_override_slots(indices).await,
+            }
+        }
+    }
 }

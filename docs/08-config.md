@@ -11,6 +11,7 @@
 model = "PRIMERGY TX1320 M4"
 backend = "ipmitool"
 interface = "open"
+path = "/dev/ipmi0"
 
 [monitor]
 fan_interval_ms = 2000
@@ -80,8 +81,9 @@ deadband = 75
 | キー | 説明 |
 |---|---|
 | `model` | 期待する機種名。起動時に FRU Product Name と照合し、不一致なら起動しない |
-| `backend` | `ipmitool`（v1）。将来 `openipmi` |
-| `interface` | ipmitool の `-I` 値。ローカルは `open`。CLI の `-I` 指定が優先 |
+| `backend` | `ipmitool`（既定・プロセス経由）/ `native` または `openipmi`（`/dev/ipmi0` を直接 ioctl、Phase 9）。CLI の `--backend` 指定が優先 |
+| `interface` | ipmitool の `-I` 値。ローカルは `open`。CLI の `-I` 指定が優先。native では不使用 |
+| `path` | native バックエンドの IPMI デバイスパス（既定 `/dev/ipmi0`）。CLI の `--device` 指定が優先 |
 
 ### `[monitor]`
 

@@ -22,8 +22,12 @@ pub struct Config {
 #[serde(default)]
 pub struct DeviceConfig {
     pub model: String,
+    /// `ipmitool`（外部コマンド経由）または `native`（/dev/ipmi0 直接 ioctl）
     pub backend: String,
+    /// backend = "ipmitool" のときの `-I` インターフェース名
     pub interface: String,
+    /// backend = "native" のときの IPMI デバイスパス
+    pub path: String,
 }
 
 impl Default for DeviceConfig {
@@ -32,6 +36,7 @@ impl Default for DeviceConfig {
             model: "PRIMERGY TX1320 M4".into(),
             backend: "ipmitool".into(),
             interface: "open".into(),
+            path: "/dev/ipmi0".into(),
         }
     }
 }

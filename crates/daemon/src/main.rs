@@ -13,16 +13,17 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use pmgfan_core::config::Config;
+use pmgfan_core::config::{Config, DeviceConfig};
 use pmgfan_core::control::{ControlParams, PiParams, PwmScope};
 use pmgfan_core::curve::Curve;
 use pmgfan_core::fan::FanReading;
 use pmgfan_core::hwmon;
 use pmgfan_core::protocol::{self, Mode};
 use pmgfan_core::sensor::TempReading;
-use pmgfan_ipmi::backend::FanControlBackend;
+use pmgfan_ipmi::backend::{Backend, FanControlBackend};
 use pmgfan_ipmi::fujitsu;
 use pmgfan_ipmi::ipmitool::IpmitoolBackend;
+use pmgfan_ipmi::native::NativeBackend;
 use tokio::time::sleep;
 
 const EXPECTED_PRODUCT: &str = "PRIMERGY TX1320 M4";
@@ -40,6 +41,12 @@ struct Cli {
     /// ipmitool -I のインターフェース（未指定時は config [device] interface → "open"）
     #[arg(short = 'I', long, global = true)]
     interface: Option<String>,
+    /// バックエンド（ipmitool | native。未指定時は config [device] backend）
+    #[arg(long, global = true)]
+    backend: Option<String>,
+    /// native バックエンドの IPMI デバイスパス（未指定時は config [device] path）
+    #[arg(long, global = true)]
+    device: Option<PathBuf>,
     /// 設定ファイル（省略時は既定値）
     #[arg(long, global = true)]
     config: Option<PathBuf>,
@@ -89,30 +96,23 @@ enum Cmd {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
     tracing_subscriber::fmt()
         .with_target(false)
         .with_writer(std::io::stderr)
         .init();
 
-    let bin = cli.ipmitool.clone();
-    let cli_iface = cli.interface.clone();
-
-    match cli.cmd.unwrap_or(Cmd::Run) {
+    match cli.cmd.take().unwrap_or(Cmd::Run) {
         Cmd::Run => {
-            let (params, cfg_iface) = build_params(cli.config.as_deref(), cli.socket.clone())?;
-            let iface = cli_iface.unwrap_or(cfg_iface);
-            let backend = IpmitoolBackend::new(bin, iface);
+            let (params, dev_cfg) = build_params(cli.config.as_deref(), cli.socket.clone())?;
+            let backend = build_backend(&cli, &dev_cfg)?;
             daemon::run(backend, params).await
         }
         cmd => {
-            // 単発コマンドでも --config の [device].interface を使う
-            // （-I 指定が最優先）
-            let cfg_iface = load_config_interface(cli.config.as_deref())?;
-            let backend = IpmitoolBackend::new(
-                bin,
-                cli_iface.or(cfg_iface).unwrap_or_else(|| "open".into()),
-            );
+            // 単発コマンドでも --config の [device] 設定を使う
+            // （--backend / -I / --device 指定が最優先）
+            let dev_cfg = load_device_config(cli.config.as_deref())?;
+            let backend = build_backend(&cli, &dev_cfg)?;
             match cmd {
                 Cmd::Probe => probe(&backend).await,
                 Cmd::Fans => {
@@ -185,25 +185,58 @@ async fn main() -> Result<()> {
 }
 
 /// `--config` が指定されている場合だけ設定を読み、
-/// `[device].interface` を返す（単発コマンド向けの軽量読み込み。
+/// `[device]` セクションを返す（単発コマンド向けの軽量読み込み。
 /// デーモン用の全検証は `build_params` が行う）。
-fn load_config_interface(config_path: Option<&Path>) -> Result<Option<String>> {
+fn load_device_config(config_path: Option<&Path>) -> Result<DeviceConfig> {
     let Some(path) = config_path else {
-        return Ok(None);
+        return Ok(DeviceConfig::default());
     };
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("cannot read config {}", path.display()))?;
     let config: Config =
         toml::from_str(&text).with_context(|| format!("invalid TOML in {}", path.display()))?;
-    Ok(Some(config.device.interface))
+    Ok(config.device)
+}
+
+/// CLI フラグ優先でバックエンドを構築する。
+fn build_backend(cli: &Cli, dev: &DeviceConfig) -> Result<Backend> {
+    let name = cli.backend.as_deref().unwrap_or(&dev.backend);
+    match name {
+        "ipmitool" => {
+            let iface = cli
+                .interface
+                .clone()
+                .unwrap_or_else(|| dev.interface.clone());
+            if iface.trim().is_empty() {
+                bail!("[device] interface must not be empty");
+            }
+            Ok(Backend::Ipmitool(IpmitoolBackend::new(
+                cli.ipmitool.clone(),
+                iface,
+            )))
+        }
+        "native" | "openipmi" => {
+            let path = cli
+                .device
+                .clone()
+                .unwrap_or_else(|| PathBuf::from(&dev.path));
+            NativeBackend::open(&path)
+                .map(Backend::Native)
+                .with_context(|| format!("cannot open IPMI device {}", path.display()))
+        }
+        other => bail!("unknown [device] backend '{other}' (expected \"ipmitool\" or \"native\")"),
+    }
 }
 
 /// `--config`（あれば読み込み、なければ既定値）から
-/// `daemon::Params` と ipmitool インターフェース名を構築する。
+/// `daemon::Params` と `[device]` 設定を構築する。
 ///
 /// 設定値はここで検証する。IPC 側の検査（apply_mode）を
 /// 迂回しないよう、不整合な設定は起動時エラーにする。
-fn build_params(config_path: Option<&Path>, socket: PathBuf) -> Result<(daemon::Params, String)> {
+fn build_params(
+    config_path: Option<&Path>,
+    socket: PathBuf,
+) -> Result<(daemon::Params, DeviceConfig)> {
     let config: Config = match config_path {
         Some(path) => {
             let text = std::fs::read_to_string(path)
@@ -263,13 +296,17 @@ fn build_params(config_path: Option<&Path>, socket: PathBuf) -> Result<(daemon::
     if config.device.interface.trim().is_empty() {
         bail!("[device] interface must not be empty");
     }
-    // 現状 ipmitool バックエンドのみ実装（native は Phase 9）。
-    // 未対応値を黙って無視しない
-    if config.device.backend != "ipmitool" {
+    if !matches!(
+        config.device.backend.as_str(),
+        "ipmitool" | "native" | "openipmi"
+    ) {
         bail!(
-            "[device] backend '{}' is not supported yet (only \"ipmitool\" is implemented)",
+            "[device] backend '{}' is not supported (\"ipmitool\" or \"native\")",
             config.device.backend
         );
+    }
+    if config.device.path.trim().is_empty() {
+        bail!("[device] path must not be empty");
     }
     for (key, v) in [
         ("cpu_emergency", config.safety.cpu_emergency),
@@ -375,27 +412,41 @@ fn build_params(config_path: Option<&Path>, socket: PathBuf) -> Result<(daemon::
         expected_model: config.device.model.clone(),
         config_path: config_path.map(|p| p.to_path_buf()),
     };
-    Ok((params, config.device.interface))
+    Ok((params, config.device))
 }
 
-async fn probe(backend: &IpmitoolBackend) -> Result<()> {
-    let mc = backend.mc_info().await.context("ipmitool mc info failed")?;
-    for line in mc.lines() {
-        let l = line.trim();
-        if l.starts_with("Manufacturer")
-            || l.starts_with("Product")
-            || l.starts_with("Firmware")
-            || l.starts_with("IPMI Version")
-        {
-            println!("{l}");
+async fn probe(backend: &Backend) -> Result<()> {
+    match backend {
+        Backend::Ipmitool(b) => {
+            let mc = b.mc_info().await.context("ipmitool mc info failed")?;
+            for line in mc.lines() {
+                let l = line.trim();
+                if l.starts_with("Manufacturer")
+                    || l.starts_with("Product")
+                    || l.starts_with("Firmware")
+                    || l.starts_with("IPMI Version")
+                {
+                    println!("{l}");
+                }
+            }
+        }
+        Backend::Native(b) => {
+            let id = b.device_id().await.context("Get Device ID failed")?;
+            println!("Device ID      : {}", id.device_id);
+            println!("Firmware Rev   : {}.{:02x}", id.fw_major, id.fw_minor);
+            println!(
+                "IPMI Version   : {}.{}",
+                id.ipmi_version & 0x0f,
+                id.ipmi_version >> 4
+            );
+            println!("Manufacturer   : {:#08x}", id.manufacturer_id);
+            println!(
+                "Product ID     : {} ({:#06x})",
+                id.product_id, id.product_id
+            );
         }
     }
-    let fru = backend.fru().await.context("ipmitool fru print failed")?;
-    let product = fru.lines().find_map(|l| {
-        l.split_once(':')
-            .filter(|(k, _)| k.trim() == "Product Name")
-            .map(|(_, v)| v.trim().to_string())
-    });
+    let product = backend.model_name().await.ok();
     match product {
         Some(p) if p.contains(EXPECTED_PRODUCT) => println!("Product Name : {p}  [OK]"),
         Some(p) => println!("Product Name : {p}  [WARN: expected '{EXPECTED_PRODUCT}']"),
@@ -404,7 +455,7 @@ async fn probe(backend: &IpmitoolBackend) -> Result<()> {
     Ok(())
 }
 
-async fn monitor(backend: &IpmitoolBackend, interval: f64) -> Result<()> {
+async fn monitor(backend: &Backend, interval: f64) -> Result<()> {
     let start = Instant::now();
     loop {
         println!("== t+{:.1}s ==============", start.elapsed().as_secs_f64());

@@ -127,24 +127,80 @@ ff 00 00
 
 ## Backend 抽象化
 
-OEM 制御を trait で隔離する:
+OEM 制御を trait で隔離する（実装は `crates/ipmi/src/backend.rs`）:
 
 ```rust
 trait FanControlBackend {
-    async fn fans(&self) -> Result<Vec<FanReading>>;
-    async fn set_global_pwm(&self, pwm: u8) -> Result<()>;
-    async fn clear_override(&self) -> Result<()>;
-    async fn read_override_slots(&self) -> Result<Vec<PwmSlot>>;
+    fn model_name(&self) -> impl Future<Output = Result<String>> + Send;
+    fn fans(&self) -> impl Future<Output = Result<Vec<FanReading>>> + Send;
+    fn temperatures(&self) -> impl Future<Output = Result<Vec<TempReading>>> + Send;
+    fn set_pwm(&self, scope: PwmScope, pwm: u8) -> impl Future<Output = Result<()>> + Send;
+    fn clear_override(&self) -> impl Future<Output = Result<()>> + Send;
+    fn read_override_slots(&self, indices: &[u8])
+        -> impl Future<Output = Result<Vec<PwmSlot>>> + Send;
 }
 ```
 
-これにより実装を交換可能にする:
+`Backend` enum が実行時に実装を切り替える:
 
 ```text
-IpmitoolBackend   v1 標準。ipmitool プロセス経由
-OpenIpmiBackend   将来。/dev/ipmi0 を直接 ioctl
-MockBackend       テスト用
+Backend::Ipmitool   既定。ipmitool プロセス経由（-I open）
+Backend::Native     /dev/ipmi0 を直接 ioctl（Phase 9）
+MockBackend         テスト用
 ```
+
+## native `/dev/ipmi0` バックエンド（Phase 9）
+
+`backend = "native"`（または `openipmi`）で ipmitool を介さず
+カーネルの OpenIPMI デバイスを直接叩く。
+
+```text
+pmgfand
+  ↓ ioctl
+/dev/ipmi0          IPMICTL_SEND_COMMAND / poll / IPMICTL_RECEIVE_MSG
+  ↓
+iRMC S5 (KCS システムインターフェース)
+```
+
+実装: `crates/ipmi/src/native.rs`。
+
+- **トランスポート**: `IPMICTL_SEND_COMMAND` で `ipmi_system_interface_addr`
+  （addr_type `0x0c`, channel `0x0f`）宛に送信し、`poll` + `IPMICTL_RECEIVE_MSG`
+  で msgid/netfn/cmd を照合して応答を受け取る。
+  **受信時は `addr_len` と `msg.data_len` にバッファ容量を設定して渡すこと**
+  （0 のまま渡すと `EMSGSIZE` になる）。
+- **機種検証**: `Get Device ID`（netfn 0x06 cmd 0x01）で Manufacturer/Product ID を
+  取得し、FRU を `Get FRU Inventory Area Info`（0x10）で列挙 →
+  common header → Product Info Area を読み Product Name を抽出する。
+  TX1320 M4 では Product Name は FRU 2（Chassis）にある。
+  FRU 読み出し（0x11）は count バイトが u8 なのでチャンクを 255 以下に抑える。
+- **SDR**: `Reserve SDR Repository`（0x22）→ `Get SDR`（0x23）で全レコードを
+  列挙。ヘッダ5バイトを読んでから `rec[4]` の長さ分だけ継続読み出しする
+  （固定サイズで一括読みすると末尾超過で失敗する BMC がある）。
+  予約喪失（0xc5）は再予約して再試行。
+- **センサー変換**: Full Sensor Record（type 0x01）のみパースし、
+  `Get Sensor Reading`（0x2d）の生値を `y = (M·x + B·10^Bexp) · 10^Rexp`
+  で線形化。ファンは sensor type 0x04、温度は 0x01。非線形
+  （linearization ≠ 0）や reading-unavailable は `rpm: None` / 不可扱いにする。
+- **OEM 制御**: `fujitsu::*_data()` のペイロードをそのまま
+  netfn 0x2e / cmd 0xf5 に流す。ipmitool backend と完全に共通。
+
+実機検証（pm-01）:
+
+| 項目 | 結果 |
+|---|---|
+| `probe` | Device ID / FRU Product Name `PRIMERGY TX1320 M4` 取得成功 |
+| `fans` | `ipmitool sdr type fan` と全スロット一致 |
+| `temps` | `ipmitool sdr type Temperature` と全センサー一致 |
+| `read` / `set-pwm` / `clear-override` | OEM 強制・解除ともに動作 |
+| `run` | 機種検証・ソケット・Curve 制御・SIGTERM 時 override 解除を確認 |
+
+制約:
+
+- `/dev/ipmi0` が必要（OpenIPMI ドライバ + `ipmi_devintf`）。root か
+  デバイスへの rw 権限が要る。`interface` 設定は native では無意味。
+- LAN 経由の IPMI（`lanplus` 等）には対応しない — リモート運用は
+  `ipmitool` backend を使う。
 
 ## 起動時検証
 

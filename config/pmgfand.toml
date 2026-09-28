@@ -4,8 +4,12 @@
 
 [device]
 model = "PRIMERGY TX1320 M4"
+# backend: "ipmitool"（既定。ipmitool プロセス経由）または
+#          "native" / "openipmi"（/dev/ipmi0 を直接 ioctl、ipmitool 不要）
 backend = "ipmitool"
 interface = "open"
+# native バックエンドの IPMI デバイスパス（backend = "native" 時のみ使用）
+path = "/dev/ipmi0"
 
 [monitor]
 fan_interval_ms = 2000

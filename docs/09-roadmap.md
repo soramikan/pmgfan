@@ -10,7 +10,7 @@
 | 6 | Ratatui TUI | 済み（監視・モード切替・Fixed/RPM ダイアログ・カーブエディタ・スコープ切替） |
 | 7 | Target RPM PI controller | ✅ 実装済み（PI + デッドバンド + 抗ワインドアップ + 参照ファン喪失で Auto 退避） |
 | 8 | 自動キャリブレーション | ✅ 実装済み（10%刻み掃引・中央値・`/var/lib/pmgfand/calibration.toml`・モード変更で中断・完了後に元モード復帰） |
-| 9 | native `/dev/ipmi0` backend | 未着手 |
+| 9 | native `/dev/ipmi0` backend | ✅ 実機検証済み（ioctl トランスポート・Device ID・FRU・SDR 線形化・OEM 制御。`backend = "native"` で選択、既定は ipmitool） |
 
 **Phase 1〜5 を完成させてから Target RPM を入れる。**
 安全機構なしに閉ループ制御を先に作ると、センサー喪失時に

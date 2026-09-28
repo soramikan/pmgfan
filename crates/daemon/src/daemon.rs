@@ -1696,6 +1696,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::manual_async_fn)]
     impl FanControlBackend for MockBackend {
         fn model_name(&self) -> impl std::future::Future<Output = IpmiResult<String>> + Send {
             async move { Ok(self.model.clone()) }

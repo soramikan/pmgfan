@@ -455,6 +455,7 @@ dependencies = [
 name = "pmgfan-ipmi"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "pmgfan-core",
  "thiserror",
  "tokio",

@@ -6,5 +6,6 @@ license.workspace = true
 
 [dependencies]
 pmgfan-core.workspace = true
+libc.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
