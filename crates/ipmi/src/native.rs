@@ -114,6 +114,15 @@ const IPMICTL_RECEIVE_MSG: u64 = ioc(
     12,
     std::mem::size_of::<IpmiRecv>() as u64,
 );
+/// バッファに収まらないメッセージを切り捨てて受け取る版。
+/// IPMICTL_RECEIVE_MSG は EMSGSIZE を返しつつメッセージを受信キューに
+/// 残すため、回復用に使用する。
+const IPMICTL_RECEIVE_MSG_TRUNC: u64 = ioc(
+    IOC_READ | IOC_WRITE,
+    IPMI_IOC_MAGIC,
+    11,
+    std::mem::size_of::<IpmiRecv>() as u64,
+);
 
 // 手書き ABI のサイズを固定する（カーネル uapi と一致しない場合は
 // コンパイル時に検出する）
@@ -241,7 +250,47 @@ impl Device {
             if r < 0 {
                 let e = std::io::Error::last_os_error();
                 match e.raw_os_error() {
-                    Some(libc::EAGAIN) => continue,
+                    // キューが空（前のポーリングで通知済みのメッセージを
+                    // 別メッセージが先に使い切った等）
+                    Some(libc::EAGAIN) => {
+                        // POLLIN と共に立った POLLERR/HUP（データ枯渇後の
+                        // 切断）では再 poll が同じ revents を返し続けるので、
+                        // デッドラインまで回さず即エラーにする
+                        if pfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+                            return Err(std::io::Error::other(format!(
+                                "ipmi device error after poll (revents {:#x})",
+                                pfd.revents
+                            ))
+                            .into());
+                        }
+                        continue;
+                    }
+                    // 受信バッファに収まらないメッセージはキューに残り、
+                    // 以降の受信が EMSGSIZE を返し続けるので
+                    // TRUNC 版で読み捨てて回復する。
+                    // （data_buf=512B > IPMI 最大応答長 255B のため通常は到達しない）
+                    Some(libc::EMSGSIZE) => {
+                        let mut drop_recv = IpmiRecv {
+                            recv_type: 0,
+                            addr: addr_buf.as_mut_ptr(),
+                            addr_len: addr_buf.len() as u32,
+                            msgid: 0,
+                            msg: IpmiMsg {
+                                netfn: 0,
+                                cmd: 0,
+                                data_len: data_buf.len() as u16,
+                                data: data_buf.as_mut_ptr(),
+                            },
+                        };
+                        unsafe {
+                            libc::ioctl(
+                                self.file.as_raw_fd(),
+                                IPMICTL_RECEIVE_MSG_TRUNC,
+                                &mut drop_recv,
+                            )
+                        };
+                        continue;
+                    }
                     _ => return Err(e.into()),
                 }
             }
@@ -461,6 +510,7 @@ fn scan_sdr(dev: &mut Device) -> Result<Vec<Vec<u8>>> {
                 )));
             }
             // レコードはチャンク読み。ヘッダ5バイトで本体長を確定させる。
+            // rec[4] は u8 なので total <= 5+255 = 260 が上限。
             let mut rec = Vec::new();
             let mut next_id = 0xffffu16;
             loop {
@@ -471,16 +521,25 @@ fn scan_sdr(dev: &mut Device) -> Result<Vec<Vec<u8>>> {
                 } else {
                     5
                 };
-                if total > 255 {
-                    return Err(IpmiError::Parse(format!(
-                        "sdr record {id:#06x} too large ({total} bytes)"
-                    )));
-                }
                 let remaining = total.saturating_sub(rec.len());
                 if remaining == 0 {
                     break;
                 }
-                let want = remaining.min(SDR_READ_CHUNK) as u8;
+                // Get SDR の offset は u8 なので 255 まで。それを超える
+                // offset は発行できない（実機では rec[4]<=255 → total<=260
+                // であり、offset=255 から残り全量(<=5B)を読めば完了する）。
+                // rec.len()<255 では次の offset が 255 を超えないよう
+                // 要求量を制限する。
+                if rec.len() > 255 {
+                    return Err(IpmiError::Parse(format!(
+                        "sdr record {id:#06x} exceeds addressable size"
+                    )));
+                }
+                let want = if rec.len() == 255 {
+                    remaining.min(SDR_READ_CHUNK)
+                } else {
+                    remaining.min(SDR_READ_CHUNK).min(255 - rec.len())
+                } as u8;
                 let req = [
                     resv_id as u8,
                     (resv_id >> 8) as u8,
