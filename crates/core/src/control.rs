@@ -1,5 +1,5 @@
 //! 制御ループで使うレートリミッタ（ヒステリシス）。
-//! docs/03-control.md の方針: 冷却方向は速く、静音方向はゆっくり。
+//! docs/internals/04-control.md の方針: 冷却方向は速く、静音方向はゆっくり。
 
 use serde::{Deserialize, Serialize};
 
@@ -156,7 +156,7 @@ pub struct PiParams {
 
 /// Target RPM 用 PI コントローラ。
 /// `pwm += kp*err + ki*∫err` で、参照ファンの実測 RPM を
-/// 目標値へ追従させる。D 項はファン制御では不要（docs/03）。
+/// 目標値へ追従させる。D 項はファン制御では不要（docs/internals/04-control.md）。
 ///
 /// アンチワインドアップは条件付き積分: 出力が限界に張り付き、
 /// かつ誤差がさらに同じ方向へ積み増そうとするときだけ

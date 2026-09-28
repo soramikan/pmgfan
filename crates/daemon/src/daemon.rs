@@ -207,7 +207,7 @@ fn is_healthy_state(state: DaemonState) -> bool {
 /// デーモンを起動し、シャットダウンまでブロックする。
 ///
 /// 終了時（SIGTERM/SIGINT 含む）は必ず OEM override を解除して
-/// iRMC 自動制御へ戻す（フェイルセーフ。docs/04-safety.md）。
+/// iRMC 自動制御へ戻す（フェイルセーフ。docs/internals/05-safety.md）。
 pub async fn run<B>(backend: B, params: Params) -> Result<()>
 where
     B: FanControlBackend + Send + Sync + 'static,
@@ -229,7 +229,7 @@ where
     let _instance_lock = acquire_instance_lock(&run_dir)?;
 
     // 機種検証: 想定外の機種に OEM raw コマンドを送らない
-    // （docs/02「想定外であれば制御を開始しない」）。
+    // （docs/internals/03-ipmi.md「想定外であれば制御を開始しない」）。
     match backend.model_name().await {
         Ok(model) if model.contains(&params.expected_model) => {
             info!(model = %model, "product model verified");
@@ -1630,7 +1630,7 @@ pub async fn sd_notify(msg: &str) {
 /// ただしファンポーリングの鮮度が watchdog 周期内に保たれて
 /// いるときだけ送る。ポーリングがハング（ipmitool wedged 等）
 /// しているときはキックを止め、systemd に検出・再起動させる
-/// （docs/04「プロセスハングまで考慮」）。
+/// （docs/internals/05-safety.md「プロセスハングまで考慮」）。
 fn spawn_watchdog(shared: Arc<RwLock<Shared>>) {
     let Ok(usec) = std::env::var("WATCHDOG_USEC") else {
         return;

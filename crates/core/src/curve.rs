@@ -1,4 +1,4 @@
-//! ファンカーブ。温度 → PWM の線形補間。docs/03-control.md 参照。
+//! ファンカーブ。温度 → PWM の線形補間。docs/internals/04-control.md 参照。
 
 /// カーブの1点。`temp` ℃ で `pwm` %。
 #[derive(Debug, Clone, Copy, PartialEq)]

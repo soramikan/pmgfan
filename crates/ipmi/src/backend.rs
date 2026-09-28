@@ -1,4 +1,4 @@
-//! `FanControlBackend` 抽象。docs/02-ipmi-backend.md 参照。
+//! `FanControlBackend` 抽象。docs/internals/03-ipmi.md 参照。
 
 use std::io;
 

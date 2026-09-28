@@ -1,5 +1,5 @@
 //! Unix socket サーバ。`/run/pmgfand/control.sock` で JSON Lines を受け付ける。
-//! docs/05-ipc.md 参照。
+//! docs/internals/06-ipc.md 参照。
 
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;

@@ -1,4 +1,4 @@
-//! 設定ファイルモデル。docs/08-config.md 参照。
+//! 設定ファイルモデル。docs/guide/02-configuration.md 参照。
 //! TOML へのデシリアライズは serde のみに留め、toml クレートへの
 //! 依存は呼び出し側（daemon）に限定する。
 

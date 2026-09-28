@@ -1,4 +1,4 @@
-//! Unix socket IPC プロトコル。docs/05-ipc.md 参照。
+//! Unix socket IPC プロトコル。docs/internals/06-ipc.md 参照。
 //!
 //! 1接続1行の JSON Lines。リクエスト/レスポンスともに
 //! `"version": 1` と `"type"` タグを持つ。
@@ -190,7 +190,7 @@ mod tests {
 
     #[test]
     fn set_mode_wire_formats_match_design() {
-        // docs/05-ipc.md の例と一致すること
+        // docs/internals/06-ipc.md の例と一致すること
         let auto = serde_json::to_value(Mode::IrmcAuto).unwrap();
         assert_eq!(auto, serde_json::json!("irmc_auto"));
         let rpm = serde_json::to_value(Mode::TargetRpm {
