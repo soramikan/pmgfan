@@ -48,6 +48,7 @@ sudo usermod -aG pmgfan sora
   "state": "controlling",
   "mode": {"fixed_pwm": 40},
   "pwm": 40,
+  "pwm_scope": "chassis",
   "fans": [
     {"name":"FAN CPU","rpm":2875,"status":"ok"},
     {"name":"FAN1 SYS","rpm":2400,"status":"ok"}
@@ -109,6 +110,23 @@ iRMC Auto:
 `[[curve]]` セクションを設定ファイルへ書き戻してから
 実行時状態へ適用する（永続化失敗時は適用しない）。
 config 無し起動では実行時適用のみ。
+
+### PWM スコープ切替
+
+```json
+{"type":"set_pwm_scope","scope":"chassis"}
+```
+
+`scope` は `"all"`（PSU を含む全ファン = OEM `0xff`）または
+`"chassis"`（シャーシファンのみ = `0x03`、PSU は iRMC 自動制御）。
+`set_curves` と同じく `--config` 起動時は `[control] pwm_scope`
+を設定ファイルへ書き戻してから実行時状態へ適用する。
+強制中に切り替わった場合、制御ループが次 tick で同じ PWM を
+新スコープで書き直す（値が同じでもスコープバイトが異なる
+別コマンドのため再送が必要）。
+
+現在のスコープは `status` レスポンスの `pwm_scope` フィールドで
+確認できる（ランタイム値が正。config は起動時の初期値）。
 
 ## 権限モデル
 

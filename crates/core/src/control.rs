@@ -1,8 +1,11 @@
 //! 制御ループで使うレートリミッタ（ヒステリシス）。
 //! docs/03-control.md の方針: 冷却方向は速く、静音方向はゆっくり。
 
+use serde::{Deserialize, Serialize};
+
 /// PWM 強制の適用範囲（iRMC `W` コマンドのスコープバイト）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum PwmScope {
     /// 全ファン（PSU を含む）。設定値 `all`
     All,

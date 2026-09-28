@@ -3,9 +3,10 @@
 `ratatui + crossterm` を使う。TUI はビューア/エディタであり、
 閉じても pmgfand の制御は継続する。
 
-実装状況: メイン画面（Mode/State/PWM・ファン一覧バー・
+実装状況: メイン画面（Mode/State/PWM+スコープ・ファン一覧バー・
 温度+スパークライン履歴・カーブプレビュー）、
 `A`/`C`/`F` キーでのモード切替、Fixed PWM ダイアログ、
+`S` PWM スコープ切替（all ↔ chassis、設定ファイルへ永続化）、
 `E` カーブエディタ（`S` でデーモン検証+設定ファイル
 永続化+即時適用）は実機動作確認済み。ログビューア・
 Target RPM 画面は未実装（`L`/`R` は告知表示のみ）。
@@ -50,8 +51,14 @@ UI は応答し続ける（要求タイムアウト 5s/10s）。
  └─────────────────────────────────────────────────────┘
 
  [A] iRMC Auto  [C] Curve  [F] Fixed PWM  [R] RPM
- [E] Edit curve [L] Logs   [Q] Quit
+ [E] Edit curve [S] Scope  [L] Logs   [Q] Quit
 ```
+
+`S` キーで PWM スコープを `chassis` ↔ `all` にトグルする。
+ヘッダーの PWM 表示の隣に `[chassis]` / `[all+PSU]` として
+現行スコープを示す（`all` は PSU ファンも強制対象になる
+ため黄色で注意表示）。切替は `set_pwm_scope` でデーモンへ
+送られ、config ファイルにも永続化される。
 
 ## Curve エディタ（`E`）
 

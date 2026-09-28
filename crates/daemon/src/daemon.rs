@@ -116,15 +116,20 @@ pub struct Shared {
     pub last_poll_ok: Instant,
     /// 現在有効なファンカーブ（SetCurves で実行時更新される）
     pub curves: Vec<Curve>,
+    /// 現在有効な PWM スコープ（SetPwmScope で実行時更新される。
+    /// ControlParams 側は起動時の値で固定のため、制御ループは
+    /// 常にこちらを参照する）
+    pub pwm_scope: PwmScope,
     pub started: Instant,
 }
 
 impl Shared {
-    fn new(startup_mode: Mode, curves: Vec<Curve>) -> Self {
+    fn new(startup_mode: Mode, curves: Vec<Curve>, pwm_scope: PwmScope) -> Self {
         Self {
             state: DaemonState::Starting,
             mode: startup_mode,
             curves,
+            pwm_scope,
             mode_generation: 0,
             pwm: None,
             fans: Vec::new(),
@@ -193,6 +198,7 @@ where
     let shared = Arc::new(RwLock::new(Shared::new(
         params.startup_mode.clone(),
         params.curves.clone(),
+        params.control.pwm_scope,
     )));
     let socket_path = params.socket_path.clone();
 
@@ -215,6 +221,16 @@ where
             params.expected_model
         ),
         Err(e) => bail!("cannot verify product model: {e}"),
+    }
+
+    // 起動時に iRMC の強制状態を一度だけ正規化する。
+    // W 書き込みはスコープ外の強制状態を変更しないため、前回の
+    // 実行が残した override（例: all スコープで強制された PSU）は
+    // chassis スコープへの書き込みでは解除されず固着する。
+    // 失敗時は clear_pending を立て、制御ループが再試行する。
+    if let Err(e) = backend.clear_override().await {
+        warn!(error = %e, "startup clear_override failed; stale force may persist");
+        shared.write().await.clear_pending = true;
     }
 
     // PWM/override 操作の直列化ロック。制御ループの書き込みと
@@ -534,6 +550,7 @@ async fn control_loop<B: FanControlBackend>(
 ) {
     let mut limiter = RateLimiter::new(params);
     let mut seen_gen = 0u64;
+    let mut seen_scope = params.pwm_scope;
     let mut ticks_since_write = 0u32;
     let mut missing_sensors: Vec<String> = Vec::new();
     let mut emergency_active = false;
@@ -556,7 +573,7 @@ async fn control_loop<B: FanControlBackend>(
         }
         // PWM 操作は apply_mode の即時解除と直列化する
         let _ctrl = ctrl.lock().await;
-        let (mode, gen, temps, curves, applied_pwm, clear_pending, sensor_stale, zero_rpm) = {
+        let (mode, gen, temps, curves, applied_pwm, clear_pending, sensor_stale, zero_rpm, scope) = {
             let s = shared.read().await;
             (
                 s.mode.clone(),
@@ -567,6 +584,7 @@ async fn control_loop<B: FanControlBackend>(
                 s.clear_pending,
                 s.last_temp_ok.elapsed() > Duration::from_secs(sensor_stale_secs),
                 s.zero_rpm_detected,
+                s.pwm_scope,
             )
         };
         {
@@ -587,19 +605,72 @@ async fn control_loop<B: FanControlBackend>(
             ticks_since_write = 0;
             seen_gen = gen;
         }
+        // スコープ切替時は、強制中の値を新スコープで直ちに書き直す。
+        // W コマンドはスコープ外のファンの強制状態を変更しないため、
+        // all→chassis で PSU に残った強制を解くには先に全スロットの
+        // override 解除が必要（実機検証済み: 解除なしでは PSU が
+        // 旧強制値のまま固着する）。IrmcAuto/pwm=None なら書く
+        // ものがないので何もしない。
+        // 緊急・フェイル経路は毎 tick `scope` を読むため自動追従する。
+        if scope != seen_scope {
+            seen_scope = scope;
+            if let Some(p) = applied_pwm {
+                info!(
+                    scope = scope.as_str(),
+                    pwm = p,
+                    "pwm scope changed; re-writing"
+                );
+                let clear_ok = match backend.clear_override().await {
+                    Ok(()) => true,
+                    Err(e) => {
+                        warn!(error = %e, "scope change: clear failed; out-of-scope fans may stay forced");
+                        let mut s = shared.write().await;
+                        s.write_failures += 1;
+                        s.last_error = Some(e.to_string());
+                        false
+                    }
+                };
+                write_pwm(backend, shared, p, failure_limit, scope).await;
+                if !clear_ok {
+                    // write_pwm の成功で clear_pending が降りても、
+                    // スコープ外ファンの強制解除は未確認のまま残す
+                    shared.write().await.clear_pending = true;
+                }
+                ticks_since_write = 0;
+            }
+        }
+
+        // override 解除の未達を、強制していないモードでも再試行する。
+        // 起動時 clear やスコープ遷移時 clear の失敗で残った
+        // スコープ外の強制（PSU 固着など）を、Auto 以外でも
+        // 放置しない。強制中（applied_pwm=Some）は解除しない
+        // — 冷却のための強制を一瞬でも落とさない。
+        if clear_pending && applied_pwm.is_none() && !matches!(mode, Mode::IrmcAuto) {
+            match backend.clear_override().await {
+                Ok(()) => {
+                    let mut s = shared.write().await;
+                    s.clear_pending = false;
+                    s.write_failures = 0;
+                    refresh_state(&mut s, failure_limit);
+                    if is_healthy_state(s.state) {
+                        s.last_error = None;
+                    }
+                    info!("override cleared (retry)");
+                }
+                Err(e) => {
+                    let mut s = shared.write().await;
+                    s.write_failures += 1;
+                    s.last_error = Some(e.to_string());
+                    warn!(error = %e, "clear_override retry failed");
+                }
+            }
+        }
 
         // 緊急温度: モードに関わらず 100% 強制が最優先
         if let Some((sensor_name, t)) = emergency_check(&temps, cpu_emergency, pch_emergency) {
             emergency_active = true;
             warn!(sensor = %sensor_name, temp = t, "emergency temperature; forcing 100% pwm");
-            write_pwm(
-                backend,
-                shared,
-                EMERGENCY_PWM,
-                failure_limit,
-                params.pwm_scope,
-            )
-            .await;
+            write_pwm(backend, shared, EMERGENCY_PWM, failure_limit, scope).await;
             let mut s = shared.write().await;
             s.state = DaemonState::Failsafe;
             s.last_error = Some(format!("emergency: {sensor_name} {t:.1}C"));
@@ -659,15 +730,7 @@ async fn control_loop<B: FanControlBackend>(
             } else {
                 "fan at 0 RPM"
             };
-            run_fail_action(
-                backend,
-                shared,
-                fail_action,
-                reason,
-                failure_limit,
-                params.pwm_scope,
-            )
-            .await;
+            run_fail_action(backend, shared, fail_action, reason, failure_limit, scope).await;
             continue;
         }
 
@@ -704,7 +767,7 @@ async fn control_loop<B: FanControlBackend>(
                 // REASSERT_TICKS ごとに再送する。
                 ticks_since_write += 1;
                 if applied_pwm != Some(p) || ticks_since_write >= REASSERT_TICKS {
-                    write_pwm(backend, shared, p, failure_limit, params.pwm_scope).await;
+                    write_pwm(backend, shared, p, failure_limit, scope).await;
                     ticks_since_write = 0;
                 }
             }
@@ -759,22 +822,14 @@ async fn control_loop<B: FanControlBackend>(
                         shared.write().await.curve_sensors_missing = false;
                         match limiter.next(target) {
                             Some(p) => {
-                                write_pwm(backend, shared, p, failure_limit, params.pwm_scope)
-                                    .await;
+                                write_pwm(backend, shared, p, failure_limit, scope).await;
                                 ticks_since_write = 0;
                             }
                             None => {
                                 ticks_since_write += 1;
                                 if ticks_since_write >= REASSERT_TICKS {
                                     if let Some(p) = limiter.current() {
-                                        write_pwm(
-                                            backend,
-                                            shared,
-                                            p,
-                                            failure_limit,
-                                            params.pwm_scope,
-                                        )
-                                        .await;
+                                        write_pwm(backend, shared, p, failure_limit, scope).await;
                                     }
                                     ticks_since_write = 0;
                                 }
@@ -1084,7 +1139,27 @@ pub fn persist_curves(path: &Path, curves: &[Curve]) -> Result<()> {
         arr.push(t);
     }
     doc["curve"] = toml_edit::Item::ArrayOfTables(arr);
+    persist_doc(path, &doc)
+}
 
+/// 実行時 PWM スコープを設定ファイルの `[control] pwm_scope`
+/// へ書き戻す。`persist_curves` と同じく tmp + rename で原子的。
+pub fn persist_scope(path: &Path, scope: PwmScope) -> Result<()> {
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
+    let mut doc = text
+        .parse::<toml_edit::DocumentMut>()
+        .with_context(|| format!("cannot parse {}", path.display()))?;
+    // 読み取り index は存在しないキーで panic するため get で確認する
+    if doc.get("control").is_none_or(|t| !t.is_table()) {
+        doc["control"] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    doc["control"]["pwm_scope"] = toml_edit::value(scope.as_str());
+    persist_doc(path, &doc)
+}
+
+/// TOML ドキュメントを tmp + rename で原子的に書き戻す。
+fn persist_doc(path: &Path, doc: &toml_edit::DocumentMut) -> Result<()> {
     let tmp = path.with_file_name(format!(
         ".{}.tmp",
         path.file_name()
@@ -1238,7 +1313,7 @@ mod tests {
     }
 
     fn shared_with_mode(mode: Mode) -> RwLock<Shared> {
-        RwLock::new(Shared::new(mode, vec![]))
+        RwLock::new(Shared::new(mode, vec![], PwmScope::All))
     }
 
     #[tokio::test]
@@ -1320,7 +1395,7 @@ mod tests {
     fn refresh_state_tracks_all_failure_domains() {
         // 失敗ドメインのいずれかが閾値超過なら Degraded、
         // 全部健全になって初めて normal に戻る（フラッピング防止）
-        let mut s = Shared::new(Mode::Curve, vec![]);
+        let mut s = Shared::new(Mode::Curve, vec![], PwmScope::All);
         s.state = DaemonState::Degraded;
         s.temp_failures = 3;
         s.fan_failures = 0;
@@ -1381,7 +1456,7 @@ mod tests {
         tokio::sync::watch::Sender<bool>,
     ) {
         let b = Arc::new(MockBackend::new());
-        let s = Arc::new(RwLock::new(Shared::new(mode, vec![])));
+        let s = Arc::new(RwLock::new(Shared::new(mode, vec![], PwmScope::All)));
         let c = Arc::new(Mutex::new(()));
         let (tx, rx) = watch::channel(false);
         let (bb, ss, cc) = (Arc::clone(&b), Arc::clone(&s), Arc::clone(&c));
@@ -1452,7 +1527,11 @@ mod tests {
     #[tokio::test]
     async fn sensor_stale_triggers_irmc_auto_and_recovers() {
         let b = Arc::new(MockBackend::new());
-        let s = Arc::new(RwLock::new(Shared::new(Mode::FixedPwm(50), vec![])));
+        let s = Arc::new(RwLock::new(Shared::new(
+            Mode::FixedPwm(50),
+            vec![],
+            PwmScope::All,
+        )));
         let c = Arc::new(Mutex::new(()));
         let (tx, rx) = watch::channel(false);
         let (bb, ss, cc) = (Arc::clone(&b), Arc::clone(&s), Arc::clone(&c));
@@ -1511,7 +1590,11 @@ mod tests {
     #[tokio::test]
     async fn sensor_stale_full_speed_action() {
         let b = Arc::new(MockBackend::new());
-        let s = Arc::new(RwLock::new(Shared::new(Mode::FixedPwm(50), vec![])));
+        let s = Arc::new(RwLock::new(Shared::new(
+            Mode::FixedPwm(50),
+            vec![],
+            PwmScope::All,
+        )));
         let c = Arc::new(Mutex::new(()));
         let (tx, rx) = watch::channel(false);
         let (bb, ss, cc) = (Arc::clone(&b), Arc::clone(&s), Arc::clone(&c));
@@ -1564,7 +1647,11 @@ mod tests {
             status: FanStatus::Ok,
         }];
         let b = Arc::new(mb);
-        let s = Arc::new(RwLock::new(Shared::new(Mode::FixedPwm(50), vec![])));
+        let s = Arc::new(RwLock::new(Shared::new(
+            Mode::FixedPwm(50),
+            vec![],
+            PwmScope::All,
+        )));
         let (_tx, rx) = watch::channel(false);
         let (bb, ss) = (Arc::clone(&b), Arc::clone(&s));
         let task = tokio::spawn(async move {
@@ -1665,6 +1752,36 @@ mod tests {
         assert_eq!(cfg.curves.len(), 2);
         assert_eq!(cfg.curves[0].sensor, "cpu_package");
         assert_eq!(cfg.curves[0].points[1], (90.0, 100.0));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// persist_scope が [control] pwm_scope を上書きし、
+    /// [control] が無い設定ではテーブルごと作ること。
+    #[test]
+    fn persist_scope_updates_control_section() {
+        let dir = std::env::temp_dir().join(format!("pmgfan-scope-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+
+        // 既存 [control] の上書き（他キーは保持）
+        std::fs::write(
+            &path,
+            "[control]\nmin_pwm = 10\npwm_scope = \"all\"\n# keep\n",
+        )
+        .unwrap();
+        persist_scope(&path, PwmScope::Chassis).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let cfg: pmgfan_core::config::Config = toml::from_str(&text).unwrap();
+        assert_eq!(cfg.control.pwm_scope, "chassis");
+        assert_eq!(cfg.control.min_pwm, 10);
+        assert!(text.contains("# keep"));
+
+        // [control] が無い設定にも追記できる
+        std::fs::write(&path, "interval_ms = 500\n").unwrap();
+        persist_scope(&path, PwmScope::All).unwrap();
+        let cfg: pmgfan_core::config::Config =
+            toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(cfg.control.pwm_scope, "all");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

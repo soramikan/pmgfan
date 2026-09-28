@@ -17,6 +17,7 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use pmgfan_core::config::Config;
+use pmgfan_core::control::PwmScope;
 use pmgfan_core::curve::Curve;
 use pmgfan_core::fan::FanStatus;
 use pmgfan_core::protocol::{CurveSpec, DaemonState, Mode, Request, Response};
@@ -60,6 +61,7 @@ struct Status {
     state: DaemonState,
     mode: Mode,
     pwm: Option<u8>,
+    pwm_scope: PwmScope,
     fans: Vec<pmgfan_core::fan::FanReading>,
     temps: Vec<pmgfan_core::sensor::TempReading>,
     uptime_secs: f64,
@@ -76,6 +78,11 @@ enum Outcome {
     CurvesFetched(Result<Vec<CurveSpec>, String>),
     /// カーブ保存（SetCurves）の結果
     CurvesSaved(Result<(), String>),
+    /// スコープ切替（SetPwmScope）の結果
+    ScopeSet {
+        scope: PwmScope,
+        result: Result<(), String>,
+    },
 }
 
 /// カーブエディタの状態。`curves` は全カーブの編集用コピー。
@@ -96,8 +103,9 @@ struct App {
     /// Fixed PWM ダイアログの下限/上限（config の control.* 由来）。
     pwm_min: u8,
     pwm_max: u8,
-    /// config の control.pwm_scope（ヘッダー表示用）
-    pwm_scope: String,
+    /// PWM 強制スコープ。起動時は config 値、
+    /// ポーリング成功後はデーモンのランタイム値に追従する
+    pwm_scope: PwmScope,
     status: Option<Status>,
     conn_error: Option<String>,
     /// `chip/label` → 温度履歴
@@ -123,7 +131,7 @@ impl App {
         curves: Vec<Curve>,
         pwm_min: u8,
         pwm_max: u8,
-        pwm_scope: String,
+        pwm_scope: PwmScope,
         tx: mpsc::UnboundedSender<Outcome>,
         rx: mpsc::UnboundedReceiver<Outcome>,
     ) -> Self {
@@ -171,6 +179,7 @@ impl App {
                     state,
                     mode,
                     pwm,
+                    pwm_scope,
                     fans,
                     temperatures,
                     uptime_secs,
@@ -178,6 +187,7 @@ impl App {
                     state,
                     mode,
                     pwm,
+                    pwm_scope,
                     fans,
                     temps: temperatures,
                     uptime_secs,
@@ -274,6 +284,35 @@ impl App {
         });
     }
 
+    /// PWM スコープを all ↔ chassis でトグルする。
+    /// SetCurves と同じく検証・永続化・適用はデーモン側。
+    fn toggle_scope(&mut self) {
+        if self.req_inflight {
+            self.notify("a request is already in flight");
+            return;
+        }
+        let scope = match self.pwm_scope {
+            PwmScope::All => PwmScope::Chassis,
+            PwmScope::Chassis => PwmScope::All,
+        };
+        self.req_inflight = true;
+        let socket = self.socket.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let r = tokio::time::timeout(
+                REQ_TIMEOUT,
+                client::request(&socket, &Request::SetPwmScope { scope }),
+            )
+            .await;
+            let result = match r {
+                Ok(Ok(resp)) => client::expect_ok(resp).map_err(|e| format!("{e:#}")),
+                Ok(Err(e)) => Err(format!("{e:#}")),
+                Err(_) => Err("request timeout".into()),
+            };
+            let _ = tx.send(Outcome::ScopeSet { scope, result });
+        });
+    }
+
     /// 要求タスクの結果を状態へ反映する。
     fn apply_outcome(&mut self, outcome: Outcome) {
         match outcome {
@@ -297,6 +336,9 @@ impl App {
                         hist.pop_front();
                     }
                 }
+                // スコープはデーモンのランタイム値を正とする
+                // （config ファイル値は接続前の初期表示用）
+                self.pwm_scope = s.pwm_scope;
                 self.status = Some(s);
             }
             Outcome::Status(Err(e)) => {
@@ -343,6 +385,23 @@ impl App {
                     // 検証・永続化失敗はエディタを開いたままにして
                     // 修正し直せるようにする
                     Err(e) => self.notify(format!("save failed: {e}")),
+                }
+            }
+            Outcome::ScopeSet { scope, result } => {
+                self.req_inflight = false;
+                match result {
+                    Ok(()) => {
+                        self.pwm_scope = scope;
+                        let note = match scope {
+                            PwmScope::Chassis => "chassis fans only (PSU: iRMC auto)",
+                            PwmScope::All => "all fans incl. PSU",
+                        };
+                        self.notify(format!("pwm scope -> {note}"));
+                        if !self.poll_inflight {
+                            self.spawn_refresh();
+                        }
+                    }
+                    Err(e) => self.notify(format!("scope change failed: {e}")),
                 }
             }
         }
@@ -396,12 +455,13 @@ pub async fn run(socket: &Path, config_path: Option<&Path>) -> Result<()> {
     }
 
     let (tx, rx) = mpsc::unbounded_channel();
+    let scope = PwmScope::parse(&cfg.pwm_scope).unwrap_or(PwmScope::All);
     let mut app = App::new(
         socket.to_path_buf(),
         cfg.curves,
         cfg.pwm_min,
         cfg.pwm_max,
-        cfg.pwm_scope,
+        scope,
         tx,
         rx,
     );
@@ -557,6 +617,7 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
                 app.pwm_dialog = Some(clamp_pwm(seed, 0, app.pwm_min, app.pwm_max));
             }
             'r' => app.notify("target RPM mode is not implemented yet (phase 7)"),
+            's' => app.toggle_scope(),
             'e' => {
                 if app.curves.is_empty() {
                     app.notify("no fan curves configured");
@@ -770,11 +831,11 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         Span::styled(state, Style::default().fg(state_color)),
         Span::styled("   PWM: ", Style::default().fg(Color::DarkGray)),
         Span::styled(pwm, Style::default().fg(Color::Yellow)),
-        // chassis スコープ時は PSU が iRMC 自動制御に残ることを表示
-        if app.pwm_scope == "chassis" {
-            Span::styled(" (PSU: auto)", Style::default().fg(Color::DarkGray))
-        } else {
-            Span::raw("")
+        // chassis スコープでは PSU が iRMC 自動制御に残る。
+        // all では PSU ファンも強制対象になるため目立つ色で示す
+        match app.pwm_scope {
+            PwmScope::Chassis => Span::styled(" [chassis]", Style::default().fg(Color::DarkGray)),
+            PwmScope::All => Span::styled(" [all+PSU]", Style::default().fg(Color::Yellow)),
         },
         Span::styled("   Up: ", Style::default().fg(Color::DarkGray)),
         Span::raw(uptime),
@@ -993,6 +1054,8 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         Span::raw("PM "),
         Span::styled("[E]", Style::default().fg(Color::Yellow)),
         Span::raw("dit "),
+        Span::styled("[S]", Style::default().fg(Color::Yellow)),
+        Span::raw("cope "),
         Span::styled("[L]", Style::default().fg(Color::Yellow)),
         Span::raw("ogs "),
         Span::styled("[Q]", Style::default().fg(Color::Yellow)),
@@ -1210,7 +1273,7 @@ mod tests {
             Vec::new(),
             DEFAULT_PWM_MIN,
             DEFAULT_PWM_MAX,
-            "all".into(),
+            PwmScope::All,
             tx,
             rx,
         )
@@ -1279,7 +1342,7 @@ mod tests {
             Vec::new(),
             40,
             80,
-            "all".into(),
+            PwmScope::All,
             tx,
             rx,
         );
@@ -1288,6 +1351,7 @@ mod tests {
             state: DaemonState::Controlling,
             mode: Mode::FixedPwm(20),
             pwm: Some(20),
+            pwm_scope: PwmScope::All,
             fans: vec![],
             temps: vec![],
             uptime_secs: 0.0,

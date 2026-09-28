@@ -14,6 +14,8 @@ pmgfanctl auto            # iRMC Auto へ戻す
 pmgfanctl pwm 40          # Fixed PWM 40%
 pmgfanctl rpm "FAN CPU" 2500   # Target RPM（Phase 7）
 pmgfanctl mode curve      # ファンカーブ制御
+pmgfanctl scope chassis   # PWM 強制をシャーシファンのみに
+pmgfanctl scope all       # PSU を含む全ファンに強制
 ```
 
 TUI のカーブ表示は `--config <path>` で読んだ `[[curve]]`

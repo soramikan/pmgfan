@@ -13,7 +13,7 @@ use pmgfan_ipmi::backend::FanControlBackend;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, RwLock};
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::daemon::{apply_mode, Shared};
 
@@ -162,6 +162,7 @@ async fn dispatch<B: FanControlBackend>(
                 state: s.state,
                 mode: s.mode.clone(),
                 pwm: s.pwm,
+                pwm_scope: s.pwm_scope,
                 fans: s.fans.clone(),
                 temperatures: s.temps.clone(),
                 uptime_secs: s.started.elapsed().as_secs_f64(),
@@ -195,6 +196,22 @@ async fn dispatch<B: FanControlBackend>(
                     Response::Ok
                 }
             }
+        }
+        Request::SetPwmScope { scope } => {
+            // 検証は型で済む（wire 上は "all"/"chassis" のみ来る）。
+            // カーブと同じく先に設定ファイルへ永続化し、成功したら
+            // ランタイムへ適用する。強制中の値は制御ループが
+            // 次 tick で新スコープへ書き直す。
+            if let Some(path) = config_path {
+                if let Err(e) = crate::daemon::persist_scope(path, scope) {
+                    return Response::Error {
+                        error: format!("config persist failed (not applied): {e:#}"),
+                    };
+                }
+            }
+            shared.write().await.pwm_scope = scope;
+            info!(scope = scope.as_str(), "pwm scope updated");
+            Response::Ok
         }
     }
 }

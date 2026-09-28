@@ -22,6 +22,11 @@ RuntimeDirectoryMode=0750
 # 存在しないと起動に失敗するので先に作成しておく
 Group=pmgfan
 
+# ProtectSystem=strict だと /etc が読み取り専用になり、
+# TUI からの設定永続化（カーブ保存・スコープ切替）が失敗する。
+# 設定ディレクトリだけ書き込み可にする。
+ReadWritePaths=/etc/pmgfand
+
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes

@@ -5,6 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::control::PwmScope;
 use crate::fan::FanReading;
 use crate::sensor::TempReading;
 
@@ -58,6 +59,11 @@ pub enum Request {
     SetCurves {
         curves: Vec<CurveSpec>,
     },
+    /// PWM 強制の適用範囲を切り替える（設定ファイルへ永続化 +
+    /// ランタイム適用。強制中なら次 tick で新スコープへ書き直す）
+    SetPwmScope {
+        scope: PwmScope,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -68,6 +74,9 @@ pub enum Response {
         mode: Mode,
         /// 現在強制している PWM（未強制なら None）
         pwm: Option<u8>,
+        /// 現在の PWM 強制スコープ（ランタイム値が正。
+        /// config ファイルではなくデーモンの実状態を返す）
+        pwm_scope: PwmScope,
         fans: Vec<FanReading>,
         temperatures: Vec<TempReading>,
         uptime_secs: f64,

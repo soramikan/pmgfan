@@ -11,6 +11,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use pmgfan_core::control::PwmScope;
 use pmgfan_core::protocol::{Mode, Request, Response};
 
 #[derive(Parser)]
@@ -56,6 +57,12 @@ enum Cmd {
         /// `auto` = iRMC 復帰、`curve` = ファンカーブ（Phase 4）
         mode: String,
     },
+    /// PWM 強制の適用範囲を切り替える（all = PSU 含む全体 /
+    /// chassis = シャーシファンのみで PSU は iRMC 自動制御）
+    Scope {
+        /// `all` または `chassis`
+        scope: String,
+    },
 }
 
 // multi_thread が必須: TUI のイベントループは crossterm の
@@ -86,10 +93,19 @@ async fn main() -> Result<()> {
                     state,
                     mode,
                     pwm,
+                    pwm_scope,
                     fans,
                     temperatures,
                     uptime_secs,
-                } => print_status(state, &mode, pwm, &fans, &temperatures, uptime_secs),
+                } => print_status(
+                    state,
+                    &mode,
+                    pwm,
+                    pwm_scope,
+                    &fans,
+                    &temperatures,
+                    uptime_secs,
+                ),
                 Response::Error { error } => anyhow::bail!("pmgfand: {error}"),
                 _ => anyhow::bail!("unexpected response"),
             }
@@ -141,6 +157,13 @@ async fn main() -> Result<()> {
             println!("mode applied");
             Ok(())
         }
+        Cmd::Scope { scope } => {
+            let scope = PwmScope::parse(&scope).map_err(anyhow::Error::msg)?;
+            let resp = client::request(&cli.socket, &Request::SetPwmScope { scope }).await?;
+            client::expect_ok(resp)?;
+            println!("pwm scope -> {}", scope.as_str());
+            Ok(())
+        }
     }
 }
 
@@ -148,6 +171,7 @@ fn print_status(
     state: pmgfan_core::protocol::DaemonState,
     mode: &Mode,
     pwm: Option<u8>,
+    pwm_scope: PwmScope,
     fans: &[pmgfan_core::fan::FanReading],
     temps: &[pmgfan_core::sensor::TempReading],
     uptime_secs: f64,
@@ -161,7 +185,9 @@ fn print_status(
     println!("Mode: {mode_str}");
     println!("State: {:?}   Uptime: {:.0}s", state, uptime_secs);
     if let Some(p) = pwm {
-        println!("PWM: {p}%");
+        println!("PWM: {p}%  (scope: {})", pwm_scope.as_str());
+    } else {
+        println!("Scope: {}", pwm_scope.as_str());
     }
     println!();
     for f in fans {
